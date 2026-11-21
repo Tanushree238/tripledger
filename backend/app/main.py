@@ -10,7 +10,7 @@ from . import models as m, schemas as s
 from .seed import seed, upgrade_demo
 from .policy import policy_for, refresh, receipt_file, evaluate, snapshot
 
-app = FastAPI(title="TripLedger API", version="1.0.0")
+app = FastAPI(title="TripLedger API", version="1.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads")); UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -220,3 +220,6 @@ def request_receipt(item_id:int,db:Session=Depends(get_db),user=Depends(current_
     if user.role not in ('manager','finance') or x.employee_id==user.id: raise HTTPException(403,'Reviewer required')
     if receipt_file(x) or not x.status.startswith('pending'): raise HTTPException(400,'Receipt request not applicable')
     log(db,'expense',x.id,user,'receipt_requested','Please attach supporting receipt'); db.commit(); return {'ok':True}
+
+from .ai.routes import make_router
+app.include_router(make_router(current_user))

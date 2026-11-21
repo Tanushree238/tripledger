@@ -1,0 +1,329 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..88d5229
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,4 @@
++AI_ENABLED=true
++AI_MODE=mock
++AI_SERVICE_URL=
++AI_TIMEOUT_SECONDS=10
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..c72b09c
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,24 @@
++name: CI
++on: [push, pull_request]
++jobs:
++  backend:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-python@v5
++        with:
++          python-version: '3.12'
++      - run: pip install -r backend/requirements.txt
++      - run: cd backend && python -m unittest discover -s tests
++  frontend:
++    runs-on: ubuntu-latest
++    defaults:
++      run:
++        working-directory: frontend
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-node@v4
++        with:
++          node-version: '22'
++      - run: npm install --no-audit --no-fund
++      - run: npm run build
+diff --git a/README.md b/README.md
+index 9ab10aa..56091ec 100644
+--- a/README.md
++++ b/README.md
+@@ -33,3 +33,17 @@ The database is seeded automatically on API startup. The demo identity is select
+ ## Notes / production hardening
+ 
+ This is a runnable MVP, not a production deployment. Before production, add SSO/OIDC, server-side authorization, migrations, malware scanning and private object storage for receipts, immutable audit storage, idempotent integrations, rate limiting, CSRF protection if cookie auth is used, and real accounting/card/booking providers. The demo role selector sends `X-Demo-Role` and `X-Demo-User` headers and must be replaced.
++
++## v1.3 AI foundation
++
++Copy `.env.example` to `.env` if custom settings are needed. Run `docker compose up --build` without deleting volumes. The AI Assistant defaults to mock mode: two read-only tasks (general expense policy guidance and scoped expense totals), with session-only messages. Free-text is passed to real providers but ignored by the mock. No AI action writes to the database. AI failure returns 503; regular workflows remain independent. `/ai/health` reports configuration, not remote liveness.
++
++The existing X-Demo-User identity mechanism is demo-only and permits impersonation; do not expose this app publicly or use real employee data without real authentication. AI scope is derived from that identity's database role, not a caller-supplied role. Only authorized aggregates and general policy settings are supplied as context; do not send confidential text to external providers without approval.
++
++### Provisional team contract
++
++Internal service POST `/execute`: body `{"request":{"task":"expense_summary","query":""},"context":{"role":"employee","department":"Sales","expense_count":2,"total_amount":3310,"exception_count":1,"policies":[]},"mode":"rag"}`. Response `{"answer":"...","provider":"rag","sources":[]}`. Set AI_MODE=baseline or rag and AI_SERVICE_URL to the internal service base URL. No real model service is included. Confirm schemas, service authentication, citation IDs and supported tasks before enabling real mode. No automatic retries or silent mock fallback. No new database migration is required for this slice.
++
++### Validation
++
++`cd backend && python -m unittest discover -s tests` after installing requirements. Four tests passed locally (SQLite, installed dependency versions); HTTP adapter tested with mocked transport. Frontend build, PostgreSQL, Docker and remote CI are not yet validated. Frontend dependency installation was blocked by unavailable npm cache/network. Production authentication, persistent conversations, RAG ingestion and write actions are deferred.
+diff --git a/backend/app/ai/__init__.py b/backend/app/ai/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/backend/app/ai/actions.py b/backend/app/ai/actions.py
+new file mode 100644
+index 0000000..2360104
+--- /dev/null
++++ b/backend/app/ai/actions.py
+@@ -0,0 +1,18 @@
++from sqlalchemy import or_
++from .. import models as m
++from .contracts import Context
++from ..policy import policy_for
++
++def build_context(db, user):
++    # No model-generated SQL or mutations. Scope is derived from the database identity.
++    q = db.query(m.Expense)
++    if user.role == 'employee': q = q.filter(m.Expense.employee_id == user.id)
++    elif user.role == 'manager':
++        reports = db.query(m.Employee.id).filter(m.Employee.manager_id == user.id)
++        q = q.filter(or_(m.Expense.employee_id == user.id, m.Expense.employee_id.in_(reports)))
++    elif user.role != 'finance': raise PermissionError('Unknown role')
++    rows = q.all()
++    selected = policy_for(db, user, '*')
++    policies = [selected] if selected else []
++    applicable = [dict(name=p.name, max_expense=p.max_expense, receipt_threshold=p.receipt_threshold) for p in policies if p.role in (user.role, '*') and p.department in (user.department, '*') and p.project_code == '*']
++    return Context(role=user.role, department=user.department, expense_count=len(rows), total_amount=sum(x.amount for x in rows), exception_count=sum(bool(x.policy_flag) for x in rows), policies=applicable)
+diff --git a/backend/app/ai/contracts.py b/backend/app/ai/contracts.py
+new file mode 100644
+index 0000000..9abe36e
+--- /dev/null
++++ b/backend/app/ai/contracts.py
+@@ -0,0 +1,23 @@
++from typing import Literal
++from pydantic import BaseModel, Field, ConfigDict
++
++Task = Literal['expense_summary', 'policy_guidance']
++
++class AIRequest(BaseModel):
++    model_config = ConfigDict(extra='forbid')
++    task: Task
++    query: str = Field(default='', max_length=2000)
++
++class Context(BaseModel):
++    role: str
++    department: str
++    expense_count: int
++    total_amount: float
++    exception_count: int
++    policies: list[dict] = Field(default_factory=list)
++
++class AIResponse(BaseModel):
++    model_config = ConfigDict(extra='forbid')
++    answer: str = Field(max_length=10000)
++    provider: Literal['mock', 'baseline', 'rag']
++    sources: list[str] = Field(default_factory=list, max_length=30)
+diff --git a/backend/app/ai/providers.py b/backend/app/ai/providers.py
+new file mode 100644
+index 0000000..f321598
+--- /dev/null
++++ b/backend/app/ai/providers.py
+@@ -0,0 +1,37 @@
++import os
++from abc import ABC, abstractmethod
++import httpx
++from .contracts import AIRequest, AIResponse, Context
++
++class AIProvider(ABC):
++    @abstractmethod
++    async def execute(self, request: AIRequest, context: Context) -> AIResponse: ...
++
++class MockProvider(AIProvider):
++    async def execute(self, request, context):
++        if request.task == 'expense_summary':
++            answer = f'Visible expenses: {context.expense_count}. Total: INR {context.total_amount:,.2f}. Policy exceptions: {context.exception_count}.'
++            sources = ['TripLedger expense records']
++        else:
++            answer = '\n'.join(f"{p['name']}: expense limit INR {p['max_expense']:,.2f}; receipt required above INR {p['receipt_threshold']:,.2f}." for p in context.policies) or 'No applicable policy configured.'
++            sources = [p['name'] for p in context.policies]
++        return AIResponse(answer=answer, provider='mock', sources=sources)
++
++class HTTPProvider(AIProvider):
++    def __init__(self, mode, url, timeout=10, transport=None):
++        self.mode, self.url, self.timeout, self.transport = mode, url, timeout, transport
++    async def execute(self, request, context):
++        async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport, follow_redirects=False) as client:
++            response = await client.post(self.url.rstrip('/') + '/execute', json={'request': request.model_dump(), 'context': context.model_dump(), 'mode': self.mode})
++            response.raise_for_status()
++            result = AIResponse.model_validate(response.json())
++            if result.provider != self.mode:
++                raise ValueError('Unexpected provider')
++            return result
++
++def get_provider():
++    mode = os.getenv('AI_MODE', 'mock')
++    if mode == 'mock': return MockProvider()
++    if mode in ('baseline', 'rag') and os.getenv('AI_SERVICE_URL'):
++        return HTTPProvider(mode, os.environ['AI_SERVICE_URL'], float(os.getenv('AI_TIMEOUT_SECONDS', '10')))
++    raise ValueError('AI provider configuration unavailable')
+diff --git a/backend/app/ai/routes.py b/backend/app/ai/routes.py
+new file mode 100644
+index 0000000..52e1ca5
+--- /dev/null
++++ b/backend/app/ai/routes.py
+@@ -0,0 +1,31 @@
++import logging, os, time, uuid
++from fastapi import APIRouter, Depends, HTTPException
++from ..database import get_db
++from .contracts import AIRequest, AIResponse
++from .actions import build_context
++from .providers import get_provider
++
++logger = logging.getLogger(__name__)
++def make_router(current_user):
++    router = APIRouter(prefix='/ai', tags=['AI'])
++    @router.get('/health')
++    def health(user=Depends(current_user)):
++        enabled = os.getenv('AI_ENABLED', 'true').lower() == 'true'
++        try: get_provider(); configured = True
++        except ValueError: configured = False
++        return {'enabled': enabled, 'configured': configured, 'mode': os.getenv('AI_MODE','mock'), 'tasks': ['expense_summary','policy_guidance']}
++    @router.post('/execute', response_model=AIResponse)
++    async def execute(request: AIRequest, db=Depends(get_db), user=Depends(current_user)):
++        if os.getenv('AI_ENABLED','true').lower() != 'true': raise HTTPException(503,'AI is disabled; use the regular TripLedger workflows.')
++        trace = uuid.uuid4().hex
++        start = time.monotonic()
++        try: context = build_context(db, user)
++        except PermissionError: raise HTTPException(403,'Action not permitted')
++        try:
++            result = await get_provider().execute(request, context)
++        except Exception as exc:
++            logger.warning('AI failure trace=%s task=%s type=%s', trace, request.task, type(exc).__name__)
++            raise HTTPException(503,'AI unavailable; regular TripLedger workflows remain available.') from None
++        logger.info('AI trace=%s task=%s provider=%s elapsed_ms=%d', trace, request.task, result.provider, (time.monotonic()-start)*1000)
++        return result
++    return router
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 96228e9..51d64e8 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -10,7 +10,7 @@ from . import models as m, schemas as s
+ from .seed import seed, upgrade_demo
+ from .policy import policy_for, refresh, receipt_file, evaluate, snapshot
+ 
+-app = FastAPI(title="TripLedger API", version="1.0.0")
++app = FastAPI(title="TripLedger API", version="1.3.0")
+ app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads")); UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+ 
+@@ -220,3 +220,6 @@ def request_receipt(item_id:int,db:Session=Depends(get_db),user=Depends(current_
+     if user.role not in ('manager','finance') or x.employee_id==user.id: raise HTTPException(403,'Reviewer required')
+     if receipt_file(x) or not x.status.startswith('pending'): raise HTTPException(400,'Receipt request not applicable')
+     log(db,'expense',x.id,user,'receipt_requested','Please attach supporting receipt'); db.commit(); return {'ok':True}
++
++from .ai.routes import make_router
++app.include_router(make_router(current_user))
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index 523238f..7dd1de0 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -4,3 +4,5 @@ SQLAlchemy==2.0.36
+ psycopg[binary]==3.2.3
+ python-multipart==0.0.20
+ pydantic==2.10.4
++
++httpx==0.28.1
+diff --git a/backend/tests/test_ai.py b/backend/tests/test_ai.py
+new file mode 100644
+index 0000000..49fb413
+--- /dev/null
++++ b/backend/tests/test_ai.py
+@@ -0,0 +1,31 @@
++import asyncio, os, unittest
++from unittest.mock import patch
++import httpx
++from test_release import app
++from fastapi.testclient import TestClient
++from app.ai.providers import HTTPProvider
++from app.ai.contracts import AIRequest, Context
++
++class AIFoundation(unittest.TestCase):
++ def test_scopes_and_validation(self):
++  with TestClient(app) as c, patch.dict(os.environ, {'AI_MODE':'mock','AI_ENABLED':'true'}):
++   def run(name, task='expense_summary'):
++    return c.post('/ai/execute', headers={'X-Demo-User':name+'@northstar.demo'}, json={'task':task})
++   self.assertIn('Visible expenses: 2',run('aarav').json()['answer'])
++   self.assertIn('Visible expenses: 4',run('devika').json()['answer'])
++   self.assertIn('Visible expenses: 2',run('nisha').json()['answer'])
++   self.assertIn('25,000',run('nisha','policy_guidance').json()['answer'])
++   self.assertEqual(run('unknown').status_code,401)
++   self.assertEqual(c.post('/ai/execute',json={'task':'delete_expenses'}).status_code,422)
++   self.assertEqual(c.post('/ai/execute',json={'task':'expense_summary','role':'finance'}).status_code,422)
++   with patch.dict(os.environ,{'AI_ENABLED':'false'}): self.assertEqual(run('aarav').status_code,503)
++   with patch.dict(os.environ,{'AI_MODE':'rag','AI_SERVICE_URL':''}): self.assertEqual(run('aarav').status_code,503)
++   self.assertEqual(c.get('/expenses').status_code,200)
++ def test_http_contract(self):
++  def handler(req):
++   self.assertEqual(req.url.path,'/execute')
++   return httpx.Response(200,json={'answer':'test','provider':'rag','sources':['test']})
++  provider=HTTPProvider('rag','http://test',transport=httpx.MockTransport(handler))
++  context=Context(role='employee',department='Sales',expense_count=0,total_amount=0,exception_count=0)
++  response=asyncio.run(provider.execute(AIRequest(task='expense_summary'),context))
++  self.assertEqual(response.provider,'rag')
+diff --git a/docker-compose.yml b/docker-compose.yml
+index c425a48..4c029aa 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -17,6 +17,10 @@ services:
+     environment:
+       DATABASE_URL: postgresql+psycopg://tripledger:tripledger@db:5432/tripledger
+       UPLOAD_DIR: /app/uploads
++      AI_ENABLED: ${AI_ENABLED:-true}
++      AI_MODE: ${AI_MODE:-mock}
++      AI_SERVICE_URL: ${AI_SERVICE_URL:-}
++      AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-10}
+     ports: ["8000:8000"]
+     volumes: ["uploads:/app/uploads"]
+     depends_on:
+diff --git a/frontend/src/AI.jsx b/frontend/src/AI.jsx
+new file mode 100644
+index 0000000..1dd70ad
+--- /dev/null
++++ b/frontend/src/AI.jsx
+@@ -0,0 +1,7 @@
++import React,{useState,useEffect} from 'react';
++export default function AI({api}){
++ const [health,setHealth]=useState(null),[task,setTask]=useState('expense_summary'),[query,setQuery]=useState(''),[messages,setMessages]=useState([]),[busy,setBusy]=useState(false),[error,setError]=useState('');
++ useEffect(()=>{let live=true;api('/ai/health').then(x=>{if(live)setHealth(x)}).catch(()=>{if(live)setError('AI configuration unavailable')});return()=>{live=false}},[]);
++ async function send(e){e.preventDefault();setBusy(true);setError('');try{let result=await api('/ai/execute',{method:'POST',body:JSON.stringify({task,query})});setMessages(old=>[...old,{query:query||task,...result}]);setQuery('')}catch(e){setError(e.message)}finally{setBusy(false)}}
++ return <section className="ai-foundation"><h1>AI Assistant</h1><p>Read-only workspace guidance · {health?health.mode:'Checking configuration'}</p><p>Choose a supported task. Mock mode uses real scoped totals and configured general policy, not a language model. Project-specific policy guidance is not supported yet.</p><div aria-live="polite">{messages.map((m,i)=><article key={i} className="ai-message"><b>{m.query}</b><p style={{whiteSpace:'pre-wrap'}}>{m.answer}</p><small>Provider: {m.provider} · Sources: {m.sources.join(', ')||'None'}</small></article>)}</div>{error&&<p role="alert">{error}</p>}<form onSubmit={send}><label>Task<select value={task} onChange={e=>setTask(e.target.value)} disabled={busy}><option value="expense_summary">Expense summary</option><option value="policy_guidance">General policy guidance</option></select></label><label>Optional question<textarea value={query} onChange={e=>setQuery(e.target.value)} maxLength={2000} disabled={busy}/></label><button className="primary" disabled={busy||!health?.enabled||!health?.configured}>{busy?'Working…':'Run task'}</button></form></section>
++}
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index c2417ce..b1b53d2 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -1,4 +1,4 @@
+-import React,{useEffect,useState} from 'react';import{createRoot}from'react-dom/client';import{Plane,Receipt,LayoutDashboard,CheckCircle2,Settings,Download,Plus,Search,Bell,ChevronDown,ArrowUpRight,Wallet,ShieldCheck,Clock3,Upload,Building2,Menu,X,FileText,History,RefreshCw}from'lucide-react';import'./style.css';
++import React,{useEffect,useState} from 'react';import{createRoot}from'react-dom/client';import{Plane,Receipt,LayoutDashboard,CheckCircle2,Settings,Download,Plus,Search,Bell,ChevronDown,ArrowUpRight,Wallet,ShieldCheck,Clock3,Upload,Building2,Menu,X,FileText,History,RefreshCw}from'lucide-react';import'./style.css';import AI from './AI.jsx';
+ const API=import.meta.env.VITE_API_URL||'http://localhost:8000';
+ function App(){
+  const [role,setRole]=useState('employee'),[userEmail,setUserEmail]=useState('aarav@northstar.demo'),[tab,setTab]=useState('overview'),[boot,setBoot]=useState(null),[expenses,setExpenses]=useState([]),[travels,setTravels]=useState([]),[approvals,setApprovals]=useState([]),[summary,setSummary]=useState(null),[toast,setToast]=useState(''),[modal,setModal]=useState(''),[selected,setSelected]=useState(null),[audit,setAudit]=useState([]),[mobile,setMobile]=useState(false);
+@@ -12,7 +12,7 @@ function App(){
+  useEffect(()=>{load()},[role,userEmail]);
+  useEffect(()=>{if(toast){let t=setTimeout(()=>setToast(''),3500);return()=>clearTimeout(t)}},[toast]);
+  const money=n=>'₹'+Number(n||0).toLocaleString('en-IN',{maximumFractionDigits:0});
+- const nav=[['overview','Overview',LayoutDashboard],['travel','Travel',Plane],['expenses','Expenses',Receipt],...(role!=='employee'?[['approvals','Approvals',CheckCircle2]]:[]),...(role==='finance'?[['finance','Finance',Wallet],['policies','Policies',Settings]]:[])];
++ const nav=[['overview','Overview',LayoutDashboard],['travel','Travel',Plane],['expenses','Expenses',Receipt],['ai','AI Assistant',FileText],...(role!=='employee'?[['approvals','Approvals',CheckCircle2]]:[]),...(role==='finance'?[['finance','Finance',Wallet],['policies','Policies',Settings]]:[])];
+  async function submit(path,data){try{await api(path,{method:'POST',body:JSON.stringify(data)});setModal('');setToast('Submitted successfully');load()}catch(e){setToast(e.message)}}
+  async function decide(item,decision){try{await api(`/approvals/${item.type}/${item.item.id}`,{method:'POST',body:JSON.stringify({decision,comment:document.getElementById('approval-comment')?.value||''})});setToast('Approval updated');setSelected(null);load()}catch(e){setToast(e.message)}}
+  async function showAudit(type,id){try{setAudit(await api(`/audit/${type}/${id}`));setSelected({type,id,view:'audit'})}catch(e){setToast(e.message)}}
+@@ -31,6 +31,7 @@ function App(){
+  return <div className="app"><aside className={`sidebar ${mobile?'open':''}`}><div className="brand"><div className="brand-icon"><Plane size={19}/></div><span>tripledger</span><button className="close-mobile" onClick={()=>setMobile(false)}><X/></button></div><div className="dropdown-anchor"><button className="workspace dropdown-trigger" aria-expanded={menu==='workspace'} onClick={()=>setMenu(menu==='workspace'?'':'workspace')}><div className="workspace-logo">N</div><div><b>Northstar Labs</b><small>India workspace</small></div><ChevronDown size={15}/></button>{menu==='workspace'&&<div className="dropdown-panel"><b>Northstar Labs</b><p>Country: India · Currency: INR</p>{role==='finance'&&<button onClick={()=>go('policies')}>Workspace policy settings</button>}</div>}</div><div className="nav-label">WORKSPACE</div>{nav.map(([id,label,Icon])=><button className={`nav-item ${tab===id?'active':''}`} key={id} onClick={()=>{go(id)}}><Icon size={18}/>{label}{id==='approvals'&&approvals.length>0?<em>{approvals.length}</em>:null}</button>)}<div className="side-bottom"><div className="help-card"><ShieldCheck size={19}/><b>Policy protected</b><small>Expenses are checked against company policy.</small></div><div className="dropdown-anchor"><button className="profile dropdown-trigger" aria-expanded={menu==='profile'} onClick={()=>setMenu(menu==='profile'?'':'profile')}><div className="avatar">{who?.name?.split(' ').map(x=>x[0]).join('')||'A'}</div><div><b>{who?.name||'Loading…'}</b><small>{who?.title||role}</small></div><ChevronDown size={15}/></button>{menu==='profile'&&<div className="dropdown-panel profile-menu"><b>{who?.name}</b><p>{userEmail} · {who?.department}</p><small>Switch demo profile</small>{boot?.employees.map(p=><button key={p.id} onClick={()=>switchUser(p.email)}>{p.name} · {p.role}{p.email===userEmail?' ✓':''}</button>)}</div>}</div></div></aside>
+  <main className="main"><header className="topbar"><button className="mobile-menu" onClick={()=>setMobile(true)}><Menu/></button><div className="crumb">Workspace <span>/</span> <b>{nav.find(x=>x[0]===tab)?.[1]||'Overview'}</b></div><div className="top-actions"><div className="role-switch"><span>Viewing as</span><select value={userEmail} onChange={e=>{switchUser(e.target.value)}}>{boot?.employees.map(p=><option key={p.id} value={p.email}>{p.name} · {p.role}</option>)}</select></div><div className="dropdown-anchor"><button className="icon-btn" aria-label="Notifications" aria-expanded={menu==='bell'} onClick={()=>setMenu(menu==='bell'?'':'bell')}><Bell size={18}/>{notifications.filter(n=>!seen.includes(n.key)).length>0&&<span className="unread-count">{notifications.filter(n=>!seen.includes(n.key)).length}</span>}</button>{menu==='bell'&&<div className="dropdown-panel notification-menu"><b>Notifications</b><small>Current activity · read state for this session</small><button onClick={()=>mark(notifications.map(n=>n.key))}>Mark all as read</button>{notifications.length?notifications.map(n=><button key={n.key} onClick={()=>{mark([n.key]);go(n.tab,n.filter)}}><b>{seen.includes(n.key)?'':'● '}{n.label}</b><small>{n.detail}</small></button>):<p>No notifications</p>}</div>}</div></div></header>
+  <div className="content">
++ {tab==='ai'&&<AI key={userEmail} api={api}/>}
+  {tab==='overview'&&<><div className="welcome"><div><div className="eyebrow">SATURDAY, 21 NOVEMBER 2026</div><h1>Good morning, {who?.name?.split(' ')[0]||'there'} <span>✦</span></h1><p>Here’s what’s happening with your travel and expenses.</p></div>{role==='employee'&&<button className="primary" onClick={()=>setModal('expense')}><Plus size={17}/> New expense</button>}</div>
+  <div className="stats">{role==='finance'?statsFinance():role==='manager'?<>{stat('My expenses',personal.length,'Personally submitted',Receipt,'expenses','personal')}{stat('Team expenses',expenses.length,'Direct reports',Receipt)}{stat('Pending my approval',approvals.length,'Awaiting your decision',Clock3,'approvals')}{stat('Team travel',travels.length,'Direct reports',Plane,'travel')}{stat('Reviewed reports',expenses.filter(reviewed).length,'Team reports past manager review',CheckCircle2,'expenses','reviewed')}{stat('Team exceptions',expenses.filter(x=>x.policy_flag).length,'Policy flags',ShieldCheck,'expenses','exceptions')}</>:<>{stat('My expenses',expenses.length,'Submitted reports',Receipt)}{stat('Awaiting approval',expenses.filter(pending).length,'In approval flow',Clock3,'expenses','pending')}{stat('Travel requests',travels.length,'Trips requested',Plane,'travel')}{stat('Approved',expenses.filter(x=>x.status==='approved').length,'Expenses cleared',CheckCircle2,'expenses','approved')}{stat('Policy exceptions',expenses.filter(x=>x.policy_flag).length,'Policy flags',ShieldCheck,'expenses','exceptions')}</>}</div>
+  <div className="section-grid"><section className="panel"><div className="panel-head"><div><h2>{role==='manager'?'Team activity':'Recent expenses'}</h2><p>{role==='manager'?'Latest requests from your direct reports':role==='finance'?'Company expense submissions':'Your latest expense submissions'}</p></div><button className="text-btn" onClick={()=>go('expenses')}>View all <ArrowUpRight size={14}/></button></div><ExpenseTable items={role==='manager'?expenses:expenses} money={money} audit={showAudit} details={details}/></section><section className="panel quick"><div className="panel-head"><div><h2>Quick actions</h2><p>Get things moving</p></div></div><button onClick={()=>setModal('travel')}><span className="quick-icon purple"><Plane/></span><span><b>Request a trip</b><small>Find flights and hotels</small></span><ArrowUpRight/></button><button onClick={()=>setModal('expense')}><span className="quick-icon orange"><Receipt/></span><span><b>Submit an expense</b><small>Upload a receipt and details</small></span><ArrowUpRight/></button>{role!=='employee'&&<button onClick={()=>go('approvals')}><span className="quick-icon green"><CheckCircle2/></span><span><b>Review approvals</b><small>{approvals.length} items need attention</small></span><ArrowUpRight/></button>}</section></div>
+diff --git a/frontend/src/style.css b/frontend/src/style.css
+index f825167..418025c 100644
+--- a/frontend/src/style.css
++++ b/frontend/src/style.css
+@@ -5,3 +5,4 @@
+ 
+ .dropdown-anchor{position:relative;min-width:0}.dropdown-trigger{width:100%;text-align:left;cursor:pointer;font:inherit;color:inherit}.dropdown-trigger:hover,.stat-action:hover,.chart-action:hover{border-color:#a99aef;background:#faf9ff}.dropdown-trigger[aria-expanded=true]>svg:last-child{transform:rotate(180deg)}.dropdown-panel{position:absolute;top:100%;left:0;right:0;z-index:30;background:white;border:1px solid #e3e4ed;border-radius:12px;padding:12px;box-shadow:0 8px 24px #24204022;color:#20253a;display:grid;gap:8px;overflow-wrap:anywhere}.dropdown-panel button{text-align:left;border:0;background:#f5f4fa;padding:9px;border-radius:7px;cursor:pointer;color:inherit}.dropdown-panel button:hover{background:#eae5ff}.dropdown-panel small{display:block}.profile-menu{top:auto;bottom:100%}.notification-menu{left:auto;right:0;width:min(350px,85vw);max-height:65vh;overflow:auto}.unread-count{position:absolute;right:0;top:0;background:#7865dc;color:white;border-radius:10px;font-size:10px;padding:2px 5px}.stat-action{text-align:left;cursor:pointer;font:inherit;color:inherit;width:100%}.stat-action small{display:flex;align-items:center;justify-content:space-between}.chart-action{width:100%;background:none;border:1px solid transparent;text-align:left;cursor:pointer;padding:6px;border-radius:7px;color:inherit;font:inherit}.filter-bar{display:flex;flex-wrap:wrap;gap:8px;padding:12px}.filter-bar input,.filter-bar select{min-width:100px;max-width:100%;padding:8px;border:1px solid #e3e4ed;border-radius:7px;background:white;color:inherit}.flag{white-space:normal;display:block;margin-top:5px}button:focus-visible{outline:2px solid #7865dc;outline-offset:2px}
+ .sidebar .profile.dropdown-trigger,.sidebar .workspace.dropdown-trigger{appearance:none;font:inherit;text-align:left;width:100%;display:flex;align-items:center;gap:10px;background:#f8f8fc;border:1px solid #e9e7f1;border-radius:12px;padding:10px;color:inherit;cursor:pointer;box-sizing:border-box}.sidebar .profile.dropdown-trigger:hover,.sidebar .workspace.dropdown-trigger:hover{background:#efedfa;border-color:#d9d2f5}.sidebar .dropdown-trigger:focus-visible{outline:2px solid #7160d9;outline-offset:2px}.sidebar .profile.dropdown-trigger>div:nth-child(2),.sidebar .workspace.dropdown-trigger>div:nth-child(2){flex:1;min-width:0}.sidebar .profile.dropdown-trigger small{display:block}.sidebar .profile-menu{bottom:calc(100% + 8px);top:auto;max-height:65vh;overflow:auto}.compliance{margin-top:16px;display:grid;gap:10px}.compliance h3{font-size:15px;margin:8px 0 0}.compliance-check{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px;border:1px solid #e9e7f1;border-radius:9px}.compliance-check small{display:block;margin-top:5px}.check-pass{color:#18764e}.check-fail{color:#b45309}.receipt-preview{display:grid;gap:10px;overflow:hidden}.receipt-preview img{max-width:100%;max-height:320px;object-fit:contain}.receipt-preview iframe{width:100%;height:320px;border:1px solid #ddd}.receipt-preview a{width:fit-content;text-decoration:none}
++.ai-foundation{max-width:850px}.ai-foundation form,.ai-message{padding:20px;border:1px solid #e4e4eb;border-radius:12px;background:white;margin:16px 0}.ai-foundation label{display:flex;flex-direction:column;gap:8px;margin-bottom:12px}.ai-foundation textarea{min-height:90px;padding:10px;font:inherit;border:1px solid #ddd;border-radius:8px}.ai-message p{margin:12px 0}.ai-foundation button:disabled{opacity:.5;cursor:not-allowed}

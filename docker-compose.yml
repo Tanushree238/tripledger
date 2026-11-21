@@ -17,6 +17,10 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://tripledger:tripledger@db:5432/tripledger
       UPLOAD_DIR: /app/uploads
+      AI_ENABLED: ${AI_ENABLED:-true}
+      AI_MODE: ${AI_MODE:-mock}
+      AI_SERVICE_URL: ${AI_SERVICE_URL:-}
+      AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-10}
     ports: ["8000:8000"]
     volumes: ["uploads:/app/uploads"]
     depends_on:
