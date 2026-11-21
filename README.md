@@ -33,3 +33,17 @@ The database is seeded automatically on API startup. The demo identity is select
 ## Notes / production hardening
 
 This is a runnable MVP, not a production deployment. Before production, add SSO/OIDC, server-side authorization, migrations, malware scanning and private object storage for receipts, immutable audit storage, idempotent integrations, rate limiting, CSRF protection if cookie auth is used, and real accounting/card/booking providers. The demo role selector sends `X-Demo-Role` and `X-Demo-User` headers and must be replaced.
+
+## v1.3 AI foundation
+
+Copy `.env.example` to `.env` if custom settings are needed. Run `docker compose up --build` without deleting volumes. The AI Assistant defaults to mock mode: two read-only tasks (general expense policy guidance and scoped expense totals), with session-only messages. Free-text is passed to real providers but ignored by the mock. No AI action writes to the database. AI failure returns 503; regular workflows remain independent. `/ai/health` reports configuration, not remote liveness.
+
+The existing X-Demo-User identity mechanism is demo-only and permits impersonation; do not expose this app publicly or use real employee data without real authentication. AI scope is derived from that identity's database role, not a caller-supplied role. Only authorized aggregates and general policy settings are supplied as context; do not send confidential text to external providers without approval.
+
+### Provisional team contract
+
+Internal service POST `/execute`: body `{"request":{"task":"expense_summary","query":""},"context":{"role":"employee","department":"Sales","expense_count":2,"total_amount":3310,"exception_count":1,"policies":[]},"mode":"rag"}`. Response `{"answer":"...","provider":"rag","sources":[]}`. Set AI_MODE=baseline or rag and AI_SERVICE_URL to the internal service base URL. No real model service is included. Confirm schemas, service authentication, citation IDs and supported tasks before enabling real mode. No automatic retries or silent mock fallback. No new database migration is required for this slice.
+
+### Validation
+
+`cd backend && python -m unittest discover -s tests` after installing requirements. Four tests passed locally (SQLite, installed dependency versions); HTTP adapter tested with mocked transport. Frontend build, PostgreSQL, Docker and remote CI are not yet validated. Frontend dependency installation was blocked by unavailable npm cache/network. Production authentication, persistent conversations, RAG ingestion and write actions are deferred.

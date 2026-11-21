@@ -1,0 +1,214 @@
+--- a/backend/app/ai/contracts.py
++++ b/backend/app/ai/contracts.py
+@@ -21,3 +21,21 @@
+     answer: str = Field(max_length=10000)
+     provider: Literal['mock', 'baseline', 'rag']
+     sources: list[str] = Field(default_factory=list, max_length=30)
++
++class ReportFilters(BaseModel):
++    period_start: str | None = None
++    period_end: str | None = None
++    department: str | None = None
++    category: str | None = None
++
++class ExpenseReport(BaseModel):
++    role: str
++    provider: str = 'deterministic'
++    filters: ReportFilters
++    metrics: dict
++    categories: list[dict]
++    departments: list[dict]
++    statuses: list[dict]
++    exceptions: list[dict]
++    insights: list[dict]
++    sources: list[str] = Field(default_factory=lambda: ['TripLedger expense records', 'TripLedger policy evaluations'])
+--- a/backend/app/ai/actions.py
++++ b/backend/app/ai/actions.py
+@@ -16,3 +16,75 @@
+     policies = [selected] if selected else []
+     applicable = [dict(name=p.name, max_expense=p.max_expense, receipt_threshold=p.receipt_threshold) for p in policies if p.role in (user.role, '*') and p.department in (user.department, '*') and p.project_code == '*']
+     return Context(role=user.role, department=user.department, expense_count=len(rows), total_amount=sum(x.amount for x in rows), exception_count=sum(bool(x.policy_flag) for x in rows), policies=applicable)
++
++from collections import defaultdict
++from datetime import date
++from .contracts import ExpenseReport, ReportFilters
++
++
++def _visible_expenses(db, user):
++    q = db.query(m.Expense).join(m.Employee, m.Employee.id == m.Expense.employee_id)
++    if user.role == 'employee':
++        q = q.filter(m.Expense.employee_id == user.id)
++    elif user.role == 'manager':
++        reports = db.query(m.Employee.id).filter(m.Employee.manager_id == user.id)
++        q = q.filter(or_(m.Expense.employee_id == user.id, m.Expense.employee_id.in_(reports)))
++    elif user.role != 'finance':
++        raise PermissionError('Unknown role')
++    return q
++
++
++def build_expense_report(db, user, filters: ReportFilters):
++    # Query-level identity scoping. The caller cannot select a different role or employee.
++    q = _visible_expenses(db, user)
++    if filters.period_start:
++        q = q.filter(m.Expense.expense_date >= filters.period_start)
++    if filters.period_end:
++        q = q.filter(m.Expense.expense_date <= filters.period_end)
++    if filters.department:
++        q = q.filter(m.Employee.department == filters.department)
++    if filters.category:
++        q = q.filter(m.Expense.category == filters.category)
++    rows = q.order_by(m.Expense.expense_date.desc(), m.Expense.id.desc()).all()
++    total = round(sum(x.amount for x in rows), 2)
++    flagged = [x for x in rows if x.policy_flag]
++    categories = defaultdict(lambda: {'amount': 0.0, 'count': 0})
++    departments = defaultdict(lambda: {'amount': 0.0, 'count': 0})
++    statuses = defaultdict(int)
++    for x in rows:
++        categories[x.category]['amount'] += x.amount
++        categories[x.category]['count'] += 1
++        departments[x.employee.department]['amount'] += x.amount
++        departments[x.employee.department]['count'] += 1
++        statuses[x.status] += 1
++    def breakdown(data, key):
++        return sorted([{key: name, 'amount': round(v['amount'], 2), 'count': v['count'],
++                        'share_pct': round(100*v['amount']/total, 1) if total else 0}
++                       for name,v in data.items()], key=lambda r: (-r['amount'], r[key]))
++    by_category = breakdown(categories, 'category')
++    by_department = breakdown(departments, 'department')
++    exceptions = [dict(id=x.id, merchant=x.merchant, employee=x.employee.name,
++                       department=x.employee.department, amount=round(x.amount, 2),
++                       category=x.category, date=x.expense_date, status=x.status,
++                       reason=x.policy_flag, receipt_attached=bool(x.receipt_path)) for x in flagged]
++    insights = []
++    if rows:
++        largest = by_category[0]
++        insights.append(dict(kind='distribution', title='Largest spending category',
++                             detail=f"{largest['category']} accounts for {largest['share_pct']}% of visible spending (INR {largest['amount']:,.2f})."))
++        if flagged:
++            insights.append(dict(kind='attention', title='Policy exceptions need review',
++                                 detail=f'{len(flagged)} of {len(rows)} expenses are flagged. Review the individual reasons below.'))
++        else:
++            insights.append(dict(kind='positive', title='No recorded policy exceptions',
++                                 detail='No visible expenses currently have a policy flag.'))
++        if len(rows) < 10:
++            insights.append(dict(kind='context', title='Small reporting sample',
++                                 detail='Fewer than 10 expenses are in this view. Avoid drawing broad spending trends from this sample.'))
++    return ExpenseReport(role=user.role, filters=filters,
++        metrics=dict(total=total, count=len(rows), average=round(total/len(rows), 2) if rows else 0,
++                     exceptions=len(flagged), exception_rate=round(100*len(flagged)/len(rows), 1) if rows else 0,
++                     pending=sum(1 for x in rows if x.status.startswith('pending'))),
++        categories=by_category, departments=by_department,
++        statuses=[dict(status=k, count=v) for k,v in sorted(statuses.items())],
++        exceptions=exceptions, insights=insights)
+--- a/backend/app/ai/routes.py
++++ b/backend/app/ai/routes.py
+@@ -1,8 +1,8 @@
+ import logging, os, time, uuid
+-from fastapi import APIRouter, Depends, HTTPException
++from fastapi import APIRouter, Depends, HTTPException, Query
+ from ..database import get_db
+-from .contracts import AIRequest, AIResponse
+-from .actions import build_context
++from .contracts import AIRequest, AIResponse, ExpenseReport, ReportFilters
++from .actions import build_context, build_expense_report
+ from .providers import get_provider
+ 
+ logger = logging.getLogger(__name__)
+@@ -14,6 +14,24 @@
+         try: get_provider(); configured = True
+         except ValueError: configured = False
+         return {'enabled': enabled, 'configured': configured, 'mode': os.getenv('AI_MODE','mock'), 'tasks': ['expense_summary','policy_guidance']}
++    @router.get('/expense-report', response_model=ExpenseReport)
++    def expense_report(db=Depends(get_db), user=Depends(current_user),
++                       period_start: str | None = None, period_end: str | None = None,
++                       department: str | None = None, category: str | None = None):
++        # Report is deterministic and available independently of the LLM provider.
++        from datetime import date
++        for value in (period_start, period_end):
++            if value:
++                try: date.fromisoformat(value)
++                except ValueError: raise HTTPException(422, 'Dates must use YYYY-MM-DD')
++        if period_start and period_end and period_start > period_end:
++            raise HTTPException(422, 'Start date must not exceed end date')
++        try:
++            return build_expense_report(db, user, ReportFilters(period_start=period_start,
++                period_end=period_end, department=department, category=category))
++        except PermissionError:
++            raise HTTPException(403, 'Action not permitted')
++
+     @router.post('/execute', response_model=AIResponse)
+     async def execute(request: AIRequest, db=Depends(get_db), user=Depends(current_user)):
+         if os.getenv('AI_ENABLED','true').lower() != 'true': raise HTTPException(503,'AI is disabled; use the regular TripLedger workflows.')
+--- a/backend/tests/test_ai.py
++++ b/backend/tests/test_ai.py
+@@ -29,3 +29,26 @@
+   context=Context(role='employee',department='Sales',expense_count=0,total_amount=0,exception_count=0)
+   response=asyncio.run(provider.execute(AIRequest(task='expense_summary'),context))
+   self.assertEqual(response.provider,'rag')
++
++class ExpenseIntelligence(unittest.TestCase):
++ def test_finance_report_and_filters(self):
++  with TestClient(app) as c:
++   h={'X-Demo-User':'devika@northstar.demo'}
++   r=c.get('/ai/expense-report',headers=h)
++   self.assertEqual(r.status_code,200,r.text)
++   data=r.json()
++   self.assertEqual(data['metrics']['count'],4)
++   self.assertEqual(data['metrics']['total'],20110)
++   self.assertEqual(data['metrics']['exceptions'],1)
++   self.assertEqual(sum(x['amount'] for x in data['categories']),20110)
++   self.assertEqual(data['exceptions'][0]['merchant'],'Uber')
++   self.assertEqual(c.get('/ai/expense-report?period_start=2026-11-18',headers=h).json()['metrics']['count'],2)
++   self.assertEqual(c.get('/ai/expense-report?category=Hotel',headers=h).json()['metrics']['count'],1)
++   self.assertEqual(c.get('/ai/expense-report?period_start=bad',headers=h).status_code,422)
++   self.assertEqual(c.get('/ai/expense-report?period_start=2026-12-01&period_end=2026-11-01',headers=h).status_code,422)
++ def test_report_role_scoping(self):
++  with TestClient(app) as c:
++   for name,count in [('aarav',2),('nisha',2),('devika',4)]:
++    r=c.get('/ai/expense-report',headers={'X-Demo-User':name+'@northstar.demo'})
++    self.assertEqual(r.status_code,200,r.text)
++    self.assertEqual(r.json()['metrics']['count'],count)
+--- a/frontend/src/AI.jsx
++++ b/frontend/src/AI.jsx
+@@ -1,7 +1,17 @@
+ import React,{useState,useEffect} from 'react';
+-export default function AI({api}){
+- const [health,setHealth]=useState(null),[task,setTask]=useState('expense_summary'),[query,setQuery]=useState(''),[messages,setMessages]=useState([]),[busy,setBusy]=useState(false),[error,setError]=useState('');
+- useEffect(()=>{let live=true;api('/ai/health').then(x=>{if(live)setHealth(x)}).catch(()=>{if(live)setError('AI configuration unavailable')});return()=>{live=false}},[]);
+- async function send(e){e.preventDefault();setBusy(true);setError('');try{let result=await api('/ai/execute',{method:'POST',body:JSON.stringify({task,query})});setMessages(old=>[...old,{query:query||task,...result}]);setQuery('')}catch(e){setError(e.message)}finally{setBusy(false)}}
+- return <section className="ai-foundation"><h1>AI Assistant</h1><p>Read-only workspace guidance · {health?health.mode:'Checking configuration'}</p><p>Choose a supported task. Mock mode uses real scoped totals and configured general policy, not a language model. Project-specific policy guidance is not supported yet.</p><div aria-live="polite">{messages.map((m,i)=><article key={i} className="ai-message"><b>{m.query}</b><p style={{whiteSpace:'pre-wrap'}}>{m.answer}</p><small>Provider: {m.provider} · Sources: {m.sources.join(', ')||'None'}</small></article>)}</div>{error&&<p role="alert">{error}</p>}<form onSubmit={send}><label>Task<select value={task} onChange={e=>setTask(e.target.value)} disabled={busy}><option value="expense_summary">Expense summary</option><option value="policy_guidance">General policy guidance</option></select></label><label>Optional question<textarea value={query} onChange={e=>setQuery(e.target.value)} maxLength={2000} disabled={busy}/></label><button className="primary" disabled={busy||!health?.enabled||!health?.configured}>{busy?'Working…':'Run task'}</button></form></section>
++import {Sparkles,Wallet,ShieldAlert,Receipt,BarChart3,ArrowUpRight,RefreshCw,CheckCircle2} from 'lucide-react';
++const money=n=>new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:0}).format(n||0);
++function Breakdown({title,items,keyName}){const max=Math.max(1,...items.map(x=>x.amount));return <section className="air-panel"><h2>{title}</h2>{items.length?items.map(x=><div className="air-bar" key={x[keyName]}><div><b>{x[keyName]}</b><span>{money(x.amount)} · {x.share_pct}%</span></div><div className="air-track"><i style={{width:`${x.amount/max*100}%`}}/></div><small>{x.count} expenses</small></div>):<p>No expenses match these filters.</p>}</section>}
++export default function AI({api,onNavigate}){
++ const [view,setView]=useState('report'),[report,setReport]=useState(null),[filters,setFilters]=useState({period_start:'',period_end:'',department:'',category:''}),[loading,setLoading]=useState(false),[error,setError]=useState('');
++ const [health,setHealth]=useState(null),[task,setTask]=useState('policy_guidance'),[query,setQuery]=useState(''),[messages,setMessages]=useState([]),[busy,setBusy]=useState(false);
++ useEffect(()=>{let active=true;api('/ai/health').then(x=>active&&setHealth(x)).catch(()=>{});return()=>{active=false}},[]);
++ useEffect(()=>{let active=true;setLoading(true);setError('');const params=new URLSearchParams(Object.entries(filters).filter(([,v])=>v));api('/ai/expense-report?'+params).then(r=>{if(active)setReport(r)}).catch(e=>{if(active)setError(e.message)}).finally(()=>{if(active)setLoading(false)});return()=>{active=false}},[filters]);
++ async function ask(e){e.preventDefault();setBusy(true);setError('');try{const r=await api('/ai/execute',{method:'POST',body:JSON.stringify({task,query})});setMessages(old=>[...old,{...r,question:query||'General guidance'}]);setQuery('')}catch(e){setError(e.message)}finally{setBusy(false)}}
++ const m=report?.metrics;
++ return <section className="air-page"><header className="air-header"><div><small><Sparkles size={14}/> TRIPLEDGER INTELLIGENCE</small><h1>{view==='report'?'Expense Intelligence':'Policy Assistant'}</h1><p>{view==='report'?'Explore spending, compliance and actionable insights.':'Guidance from configured policies.'}</p></div><span className="air-mode">{view==='report'?'Live business data':`Provider: ${health?.mode||'checking'}`}</span></header>
++ <div className="air-tabs"><button className={view==='report'?'active':''} onClick={()=>setView('report')}><BarChart3 size={16}/> Expense report</button><button className={view==='assistant'?'active':''} onClick={()=>setView('assistant')}><Sparkles size={16}/> Policy assistant</button></div>
++ {error&&<div className="air-error" role="alert">{error}</div>}
++ {view==='report'?<><section className="air-panel"><div className="air-row"><h2>Report filters</h2><button className="air-text-button" onClick={()=>setFilters({period_start:'',period_end:'',department:'',category:''})}>Clear filters</button></div><div className="air-filters">{[['period_start','From','date'],['period_end','To','date'],['department','Department','text'],['category','Category','text']].map(([key,title,type])=><label key={key}>{title}<input type={type} placeholder={`All ${title.toLowerCase()}s`} value={filters[key]} onChange={e=>setFilters(f=>({...f,[key]:e.target.value}))}/></label>)}</div></section>
++ {loading&&!report?<div className="air-panel">Loading report…</div>:report?<div className={loading?'air-loading':''}><div className="air-metrics">{[[Wallet,'Total spend',money(m.total),`${m.count} expenses`],[ShieldAlert,'Policy exceptions',m.exceptions,'Require review'],[Receipt,'Average expense',money(m.average),'Per expense'],[BarChart3,'Exception rate',`${m.exception_rate}%`,`${m.pending} pending decisions`]].map(([Icon,title,value,sub])=><div className="air-metric" key={title}><div className="air-row"><span>{title}</span><Icon size={18}/></div><strong>{value}</strong><small>{sub}</small></div>)}</div><div className="air-columns"><Breakdown title="Spending by category" items={report.categories} keyName="category"/><Breakdown title="Spending by department" items={report.departments} keyName="department"/></div><section className="air-panel"><h2><Sparkles size={18}/> Insights from your data</h2>{report.insights.length?report.insights.map((x,i)=><div className="air-insight" key={i}><span>{x.kind==='attention'?<ShieldAlert size={19}/>:<BarChart3 size={19}/>}</span><div><b>{x.title}</b><p>{x.detail}</p></div></div>):<p>No expenses match your filters.</p>}</section><section className="air-panel"><div className="air-row"><h2>Expenses requiring attention</h2><span className="air-count">{report.exceptions.length} exceptions</span></div>{report.exceptions.length?report.exceptions.map(x=><article className="air-exception" key={x.id}><div className="air-row"><div><b>{x.merchant}</b><small>{x.employee} · {x.department} · {x.category} · {x.date}</small></div><strong>{money(x.amount)}</strong></div><p className="air-reason"><ShieldAlert size={16}/>{x.reason}</p><div className="air-row"><small>{x.receipt_attached?'Receipt attached':'Receipt missing'} · {x.status.replaceAll('_',' ')}</small>{onNavigate&&<button className="air-text-button" onClick={()=>onNavigate(x.id)}>View expenses <ArrowUpRight size={15}/></button>}</div></article>):<p className="air-clear"><CheckCircle2 size={18}/> No flagged expenses in this view.</p>}</section><p className="air-disclaimer">Source: authorized TripLedger expense records and recorded policy flags. Insights are deterministic and do not represent an AI approval decision.</p></div>:null}</>:<section className="air-panel air-assistant"><h2>Ask about configured policy</h2><p>Project-specific questions are not supported until the team's RAG integration is ready.</p>{messages.map((x,i)=><article className="air-answer" key={i}><b>{x.question}</b><p>{x.answer}</p><small>Provider: {x.provider} · Sources: {x.sources.join(', ')}</small></article>)}<form onSubmit={ask}><label>Task<select value={task} onChange={e=>setTask(e.target.value)}><option value="policy_guidance">General policy guidance</option><option value="expense_summary">Expense summary</option></select></label><label>Question<textarea value={query} onChange={e=>setQuery(e.target.value)} placeholder="What is my receipt threshold?" maxLength={2000}/></label><button className="air-submit" disabled={busy||!health?.enabled||!health?.configured}>{busy?'Working…':'Get guidance'} <ArrowUpRight size={16}/></button></form></section>}</section>
+ }
+--- a/frontend/src/style.css
++++ b/frontend/src/style.css
+@@ -6,3 +6,5 @@
+ .dropdown-anchor{position:relative;min-width:0}.dropdown-trigger{width:100%;text-align:left;cursor:pointer;font:inherit;color:inherit}.dropdown-trigger:hover,.stat-action:hover,.chart-action:hover{border-color:#a99aef;background:#faf9ff}.dropdown-trigger[aria-expanded=true]>svg:last-child{transform:rotate(180deg)}.dropdown-panel{position:absolute;top:100%;left:0;right:0;z-index:30;background:white;border:1px solid #e3e4ed;border-radius:12px;padding:12px;box-shadow:0 8px 24px #24204022;color:#20253a;display:grid;gap:8px;overflow-wrap:anywhere}.dropdown-panel button{text-align:left;border:0;background:#f5f4fa;padding:9px;border-radius:7px;cursor:pointer;color:inherit}.dropdown-panel button:hover{background:#eae5ff}.dropdown-panel small{display:block}.profile-menu{top:auto;bottom:100%}.notification-menu{left:auto;right:0;width:min(350px,85vw);max-height:65vh;overflow:auto}.unread-count{position:absolute;right:0;top:0;background:#7865dc;color:white;border-radius:10px;font-size:10px;padding:2px 5px}.stat-action{text-align:left;cursor:pointer;font:inherit;color:inherit;width:100%}.stat-action small{display:flex;align-items:center;justify-content:space-between}.chart-action{width:100%;background:none;border:1px solid transparent;text-align:left;cursor:pointer;padding:6px;border-radius:7px;color:inherit;font:inherit}.filter-bar{display:flex;flex-wrap:wrap;gap:8px;padding:12px}.filter-bar input,.filter-bar select{min-width:100px;max-width:100%;padding:8px;border:1px solid #e3e4ed;border-radius:7px;background:white;color:inherit}.flag{white-space:normal;display:block;margin-top:5px}button:focus-visible{outline:2px solid #7865dc;outline-offset:2px}
+ .sidebar .profile.dropdown-trigger,.sidebar .workspace.dropdown-trigger{appearance:none;font:inherit;text-align:left;width:100%;display:flex;align-items:center;gap:10px;background:#f8f8fc;border:1px solid #e9e7f1;border-radius:12px;padding:10px;color:inherit;cursor:pointer;box-sizing:border-box}.sidebar .profile.dropdown-trigger:hover,.sidebar .workspace.dropdown-trigger:hover{background:#efedfa;border-color:#d9d2f5}.sidebar .dropdown-trigger:focus-visible{outline:2px solid #7160d9;outline-offset:2px}.sidebar .profile.dropdown-trigger>div:nth-child(2),.sidebar .workspace.dropdown-trigger>div:nth-child(2){flex:1;min-width:0}.sidebar .profile.dropdown-trigger small{display:block}.sidebar .profile-menu{bottom:calc(100% + 8px);top:auto;max-height:65vh;overflow:auto}.compliance{margin-top:16px;display:grid;gap:10px}.compliance h3{font-size:15px;margin:8px 0 0}.compliance-check{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px;border:1px solid #e9e7f1;border-radius:9px}.compliance-check small{display:block;margin-top:5px}.check-pass{color:#18764e}.check-fail{color:#b45309}.receipt-preview{display:grid;gap:10px;overflow:hidden}.receipt-preview img{max-width:100%;max-height:320px;object-fit:contain}.receipt-preview iframe{width:100%;height:320px;border:1px solid #ddd}.receipt-preview a{width:fit-content;text-decoration:none}
+ .ai-foundation{max-width:850px}.ai-foundation form,.ai-message{padding:20px;border:1px solid #e4e4eb;border-radius:12px;background:white;margin:16px 0}.ai-foundation label{display:flex;flex-direction:column;gap:8px;margin-bottom:12px}.ai-foundation textarea{min-height:90px;padding:10px;font:inherit;border:1px solid #ddd;border-radius:8px}.ai-message p{margin:12px 0}.ai-foundation button:disabled{opacity:.5;cursor:not-allowed}
++/* AI expense intelligence */
++.air-page{max-width:1200px;margin:auto;color:#2c3045;font-size:13px}.air-header,.air-row{display:flex;align-items:center;justify-content:space-between;gap:12px}.air-header{margin-bottom:24px}.air-header small{display:flex;gap:6px;align-items:center;color:#6259d3;font-weight:800;letter-spacing:1px}.air-header h1{font:800 27px Manrope;margin:8px 0}.air-header p,.air-panel p{color:#83889c;line-height:1.6}.air-mode,.air-count{border-radius:20px;padding:8px 12px;background:#f1efff;color:#655bd5;font-size:11px;font-weight:700}.air-tabs{display:flex;border-bottom:1px solid #e9eaf2;margin-bottom:20px;gap:10px}.air-tabs button{border:0;border-bottom:2px solid transparent;background:transparent;padding:12px 14px;display:flex;gap:8px;align-items:center;color:#8c90a4;font-weight:700}.air-tabs button.active{color:#6157d1;border-color:#6157d1}.air-panel,.air-metric{background:#fff;border:1px solid #e8e9f1;border-radius:14px;padding:20px;margin-bottom:17px;box-shadow:0 2px 8px #20204008}.air-panel h2{font:800 14px Manrope;display:flex;align-items:center;gap:8px;margin:0 0 20px}.air-row h2{margin:0}.air-filters{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:17px}.air-filters label,.air-assistant label{font-size:11px;font-weight:700;color:#6b7084}.air-filters input,.air-assistant select,.air-assistant textarea{display:block;width:100%;min-width:0;margin-top:8px;padding:10px;border:1px solid #e0e2ec;border-radius:8px;background:#fff;color:#30354b;outline:none}.air-filters input:focus,.air-assistant select:focus,.air-assistant textarea:focus{border-color:#7166d9}.air-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.air-metric{display:grid;gap:12px}.air-metric .air-row{color:#85899d;font-weight:700;font-size:11px}.air-metric .air-row svg{color:#7065d7}.air-metric strong{font:800 24px Manrope}.air-metric small,.air-bar small,.air-exception small{color:#999daf;font-size:10px}.air-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.air-bar{margin-bottom:19px}.air-bar>div:first-child{display:flex;justify-content:space-between;gap:12px;font-size:11px;margin-bottom:9px}.air-bar span{color:#7d8296}.air-track{height:9px;background:#f0effb;border-radius:8px;overflow:hidden;margin-bottom:6px}.air-track i{display:block;height:100%;background:#786de1;border-radius:8px}.air-insight{display:flex;align-items:flex-start;gap:12px;padding:14px 0;border-top:1px solid #f0f0f5}.air-insight>span{background:#f0edff;color:#665bd5;border-radius:9px;padding:9px}.air-insight b{font-size:12px}.air-insight p{font-size:11px;margin:5px 0}.air-exception{border:1px solid #ececf3;border-radius:11px;padding:15px;margin-bottom:12px}.air-exception b{font-size:13px}.air-exception small{display:block;margin-top:5px}.air-exception strong{font:800 17px Manrope}.air-reason{display:flex;align-items:center;gap:9px;background:#fff5ec;border-radius:8px;padding:11px;color:#ae6b29!important;font-size:11px}.air-text-button{border:0;background:none;color:#6258cf;font-weight:700;display:flex;align-items:center;gap:5px}.air-clear{display:flex;align-items:center;gap:8px}.air-disclaimer{font-size:10px;color:#9296a8}.air-loading{opacity:.6}.air-error{background:#fff0ed;color:#b34737;padding:13px;border-radius:9px;margin-bottom:15px}.air-assistant{max-width:800px}.air-answer{border:1px solid #eeecf8;background:#faf9ff;border-radius:10px;padding:15px;margin:15px 0}.air-answer p{white-space:pre-wrap}.air-answer small{color:#989bac}.air-assistant form{display:grid;gap:15px}.air-assistant textarea{min-height:90px}.air-submit{border:0;border-radius:9px;background:#665bd5;color:white;padding:12px 15px;display:flex;align-items:center;justify-content:center;gap:7px;font-weight:700}.air-submit:disabled{opacity:.5}@media(max-width:1100px){.air-metrics,.air-filters{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:700px){.air-header{align-items:flex-start;flex-direction:column}.air-metrics,.air-columns,.air-filters{grid-template-columns:1fr}.air-panel{padding:15px}.air-header h1{font-size:22px}}
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -31,7 +31,7 @@
+  return <div className="app"><aside className={`sidebar ${mobile?'open':''}`}><div className="brand"><div className="brand-icon"><Plane size={19}/></div><span>tripledger</span><button className="close-mobile" onClick={()=>setMobile(false)}><X/></button></div><div className="dropdown-anchor"><button className="workspace dropdown-trigger" aria-expanded={menu==='workspace'} onClick={()=>setMenu(menu==='workspace'?'':'workspace')}><div className="workspace-logo">N</div><div><b>Northstar Labs</b><small>India workspace</small></div><ChevronDown size={15}/></button>{menu==='workspace'&&<div className="dropdown-panel"><b>Northstar Labs</b><p>Country: India · Currency: INR</p>{role==='finance'&&<button onClick={()=>go('policies')}>Workspace policy settings</button>}</div>}</div><div className="nav-label">WORKSPACE</div>{nav.map(([id,label,Icon])=><button className={`nav-item ${tab===id?'active':''}`} key={id} onClick={()=>{go(id)}}><Icon size={18}/>{label}{id==='approvals'&&approvals.length>0?<em>{approvals.length}</em>:null}</button>)}<div className="side-bottom"><div className="help-card"><ShieldCheck size={19}/><b>Policy protected</b><small>Expenses are checked against company policy.</small></div><div className="dropdown-anchor"><button className="profile dropdown-trigger" aria-expanded={menu==='profile'} onClick={()=>setMenu(menu==='profile'?'':'profile')}><div className="avatar">{who?.name?.split(' ').map(x=>x[0]).join('')||'A'}</div><div><b>{who?.name||'Loading…'}</b><small>{who?.title||role}</small></div><ChevronDown size={15}/></button>{menu==='profile'&&<div className="dropdown-panel profile-menu"><b>{who?.name}</b><p>{userEmail} · {who?.department}</p><small>Switch demo profile</small>{boot?.employees.map(p=><button key={p.id} onClick={()=>switchUser(p.email)}>{p.name} · {p.role}{p.email===userEmail?' ✓':''}</button>)}</div>}</div></div></aside>
+  <main className="main"><header className="topbar"><button className="mobile-menu" onClick={()=>setMobile(true)}><Menu/></button><div className="crumb">Workspace <span>/</span> <b>{nav.find(x=>x[0]===tab)?.[1]||'Overview'}</b></div><div className="top-actions"><div className="role-switch"><span>Viewing as</span><select value={userEmail} onChange={e=>{switchUser(e.target.value)}}>{boot?.employees.map(p=><option key={p.id} value={p.email}>{p.name} · {p.role}</option>)}</select></div><div className="dropdown-anchor"><button className="icon-btn" aria-label="Notifications" aria-expanded={menu==='bell'} onClick={()=>setMenu(menu==='bell'?'':'bell')}><Bell size={18}/>{notifications.filter(n=>!seen.includes(n.key)).length>0&&<span className="unread-count">{notifications.filter(n=>!seen.includes(n.key)).length}</span>}</button>{menu==='bell'&&<div className="dropdown-panel notification-menu"><b>Notifications</b><small>Current activity · read state for this session</small><button onClick={()=>mark(notifications.map(n=>n.key))}>Mark all as read</button>{notifications.length?notifications.map(n=><button key={n.key} onClick={()=>{mark([n.key]);go(n.tab,n.filter)}}><b>{seen.includes(n.key)?'':'● '}{n.label}</b><small>{n.detail}</small></button>):<p>No notifications</p>}</div>}</div></div></header>
+  <div className="content">
+- {tab==='ai'&&<AI key={userEmail} api={api}/>}
++ {tab==='ai'&&<AI key={userEmail} api={api} onNavigate={()=>go('expenses')}/>}
+  {tab==='overview'&&<><div className="welcome"><div><div className="eyebrow">SATURDAY, 21 NOVEMBER 2026</div><h1>Good morning, {who?.name?.split(' ')[0]||'there'} <span>✦</span></h1><p>Here’s what’s happening with your travel and expenses.</p></div>{role==='employee'&&<button className="primary" onClick={()=>setModal('expense')}><Plus size={17}/> New expense</button>}</div>
+  <div className="stats">{role==='finance'?statsFinance():role==='manager'?<>{stat('My expenses',personal.length,'Personally submitted',Receipt,'expenses','personal')}{stat('Team expenses',expenses.length,'Direct reports',Receipt)}{stat('Pending my approval',approvals.length,'Awaiting your decision',Clock3,'approvals')}{stat('Team travel',travels.length,'Direct reports',Plane,'travel')}{stat('Reviewed reports',expenses.filter(reviewed).length,'Team reports past manager review',CheckCircle2,'expenses','reviewed')}{stat('Team exceptions',expenses.filter(x=>x.policy_flag).length,'Policy flags',ShieldCheck,'expenses','exceptions')}</>:<>{stat('My expenses',expenses.length,'Submitted reports',Receipt)}{stat('Awaiting approval',expenses.filter(pending).length,'In approval flow',Clock3,'expenses','pending')}{stat('Travel requests',travels.length,'Trips requested',Plane,'travel')}{stat('Approved',expenses.filter(x=>x.status==='approved').length,'Expenses cleared',CheckCircle2,'expenses','approved')}{stat('Policy exceptions',expenses.filter(x=>x.policy_flag).length,'Policy flags',ShieldCheck,'expenses','exceptions')}</>}</div>
+  <div className="section-grid"><section className="panel"><div className="panel-head"><div><h2>{role==='manager'?'Team activity':'Recent expenses'}</h2><p>{role==='manager'?'Latest requests from your direct reports':role==='finance'?'Company expense submissions':'Your latest expense submissions'}</p></div><button className="text-btn" onClick={()=>go('expenses')}>View all <ArrowUpRight size={14}/></button></div><ExpenseTable items={role==='manager'?expenses:expenses} money={money} audit={showAudit} details={details}/></section><section className="panel quick"><div className="panel-head"><div><h2>Quick actions</h2><p>Get things moving</p></div></div><button onClick={()=>setModal('travel')}><span className="quick-icon purple"><Plane/></span><span><b>Request a trip</b><small>Find flights and hotels</small></span><ArrowUpRight/></button><button onClick={()=>setModal('expense')}><span className="quick-icon orange"><Receipt/></span><span><b>Submit an expense</b><small>Upload a receipt and details</small></span><ArrowUpRight/></button>{role!=='employee'&&<button onClick={()=>go('approvals')}><span className="quick-icon green"><CheckCircle2/></span><span><b>Review approvals</b><small>{approvals.length} items need attention</small></span><ArrowUpRight/></button>}</section></div>
