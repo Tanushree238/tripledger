@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Frontend
+node_modules/
+dist/
+build/
+.vite/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Uploaded receipts and local database files
+uploads/
+*.db
+*.sqlite3
+postgres_data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
