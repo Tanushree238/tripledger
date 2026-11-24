@@ -3,6 +3,13 @@ from pathlib import Path
 from sqlalchemy import case
 from . import models as m
 UPLOAD_DIR=Path(os.getenv('UPLOAD_DIR','./uploads'))
+
+def receipt_requests(db):
+    return db.query(m.AuditLog.item_id).filter(
+        m.AuditLog.item_type == 'expense',
+        m.AuditLog.action == 'receipt_requested',
+    )
+
 def policy_for(db, person, project):
     return db.query(m.Policy).filter(m.Policy.enabled.is_(True),m.Policy.role==person.role,m.Policy.department.in_(['*',person.department]),m.Policy.project_code.in_(['*',project])).order_by(case((m.Policy.department==person.department,1),else_=0).desc(),case((m.Policy.project_code==project,1),else_=0).desc(),m.Policy.id.desc()).first()
 def receipt_file(x):

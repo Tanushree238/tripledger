@@ -23,6 +23,7 @@ class AIResponse(BaseModel):
     sources: list[str] = Field(default_factory=list, max_length=30)
 
 class ReportFilters(BaseModel):
+    scope: Literal['visible', 'personal'] = 'visible'
     period_start: str | None = None
     period_end: str | None = None
     department: str | None = None
