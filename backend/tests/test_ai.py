@@ -6,17 +6,183 @@ from test_release import app
 from fastapi.testclient import TestClient
 from app.ai.providers import HTTPProvider
 from app.ai.contracts import AIRequest, Context
+from app.ai.receipt_extraction import extract_receipt, parse_receipt
+from app.ai.azure_receipts import extract_azure, normalize_result
 
 class AIFoundation(unittest.TestCase):
+ def test_currency_codes_need_monetary_context(self):
+  invoice = '3 CAD Hospitality LLP\nInvoice Date: 18 Dec 2023\nTotal ₹263.00'
+  self.assertEqual(parse_receipt(invoice).fields.amount, 263)
+  for marker in ('Currency CAD', 'Total CAD 263.00', 'Total 263.00 CAD'):
+   with self.subTest(marker=marker):
+    self.assertIsNone(parse_receipt(invoice + '\n' + marker).fields.amount)
+
+ def test_azure_preview_completes_missing_details_with_matching_local_total(self):
+  def azure_preview():
+   return normalize_result({'analyzeResult': {
+       'content': 'LODGING RECEIPT',
+       'documents': [{'fields': {'Total': {'confidence': .98, 'valueCurrency': {'amount': 600, 'currencyCode': 'INR'}}}}],
+   }})
+  with TestClient(app) as client, patch.dict(os.environ, {'RECEIPT_EXTRACTION_MODE':'azure','AI_ENABLED':'true'}):
+   files = {'file': ('example.pdf', b'%PDF-1.4\nexample')}
+   for total in (600, 601):
+    fallback = parse_receipt(f'Example Travel\nInvoice Date: 08/08/2025\nGrand Total INR {total}')
+    with patch('app.ai.routes.extract_azure', return_value=azure_preview()), patch(
+        'app.ai.routes.extract_receipt', return_value=fallback):
+     response = client.post('/ai/receipt-preview', files=files).json()
+    self.assertEqual(response['provider'], 'azure')
+    self.assertEqual(response['fields']['amount'], 600)
+    self.assertEqual(response['fields']['category'], 'Hotel')
+    self.assertEqual(response['fields']['merchant'], 'Example Travel' if total == 600 else None)
+    self.assertEqual(response['fields']['expense_date'], '2025-08-08' if total == 600 else None)
+
+ def test_azure_invoice_fields_category_and_document_count(self):
+  fields = {
+      'VendorName': {'confidence': .98, 'valueString': 'Example Hotel'},
+      'InvoiceDate': {'confidence': .95, 'valueDate': '2026-11-20'},
+      'InvoiceTotal': {'confidence': .98, 'valueCurrency': {'amount': 7952, 'currencyCode': 'INR'}},
+  }
+  analysis = {'content': 'Example Hotel\nLODGING RECEIPT', 'documents': [{'fields': fields}]}
+  result = normalize_result({'analyzeResult': analysis}, 'azure-invoice')
+  self.assertEqual((result.fields.merchant, result.fields.amount, result.fields.category),
+                   ('Example Hotel', 7952, 'Hotel'))
+  self.assertIn('no matching', normalize_result({'analyzeResult': {'documents': []}}).warning)
+  self.assertIn('multiple documents', normalize_result({'analyzeResult': {'documents': [{}, {}]}}).warning)
+
+ def test_azure_preview_falls_back_only_when_no_document_matched(self):
+  empty = normalize_result({'analyzeResult': {'documents': []}})
+  multiple = normalize_result({'analyzeResult': {'documents': [{}, {}]}})
+  with TestClient(app) as client, patch.dict(os.environ, {'RECEIPT_EXTRACTION_MODE':'azure','AI_ENABLED':'true'}):
+   with patch('app.ai.routes.extract_azure', side_effect=[empty, multiple]), patch(
+       'app.ai.routes.extract_receipt', return_value=parse_receipt('MEAL RECEIPT')) as local:
+    files = {'file': ('sample.pdf', b'%PDF-1.4\nexample')}
+    result = client.post('/ai/receipt-preview', files=files).json()
+    self.assertEqual((result['provider'], result['fields']['category']), ('local', 'Meals'))
+    result = client.post('/ai/receipt-preview', files=files).json()
+    self.assertIn('multiple documents', result['warning'])
+    self.assertEqual(local.call_count, 1)
+
+ def test_travel_invoice_layouts_preserve_issuer_and_tax_inclusive_total(self):
+  travel = parse_receipt('Booking ID\nTRAVEL (INDIA) PRIVATE LIMITED\nInvoice Date: 08/08/2025\n'
+                         'Hotel Name    City\nAccommodation Charges\nGrand Total INR 3952.95')
+  self.assertEqual((travel.fields.merchant, travel.fields.category), ('TRAVEL (INDIA) PRIVATE LIMITED', 'Hotel'))
+  flight = parse_receipt('Tax Invoice    Sample Aviation Limited\nDate: 06/10/2023\n'
+                         'PNR: Example    Flight No: EX-1\nCurrency: INR\nTax     Total(Incl\n'
+                         'Grand Total     12.00     15.00     27.00')
+  self.assertEqual((flight.fields.amount, flight.fields.category), (27, 'Airfare'))
+  self.assertIsNone(parse_receipt('Date: 06/10/2023\nCurrency: INR\n'
+                                  'Grand Total     12.00     15.00     27.00').fields.amount)
+  receipt = parse_receipt('Date of issue: Sat, 4 Jan, 2025    Invoice issued by: Example Pvt Ltd\n'
+                          'GSTIN: 27AABCB3428P1ZF\nTotal Amount before Tax : 127.12\n'
+                          'Total Amount : GST : 22.88\nTotal Amount after Tax :\n150.00')
+  self.assertEqual((receipt.fields.merchant, str(receipt.fields.expense_date), receipt.fields.amount),
+                   ('Example Pvt Ltd', '2025-01-04', 150))
+
+ def test_invoice_tables_and_date_priority(self):
+  invoice = parse_receipt(
+      'Sample Furnishings Limited     Tax Invoice\nGSTIN: 06AABCW7791A1ZB\n'
+      'Order Date: Dec 20,2025\nInvoice Date: Dec 28, 2025\nTotal Amount    7  10348')
+  self.assertEqual((invoice.fields.merchant, str(invoice.fields.expense_date), invoice.fields.amount),
+                   ('Sample Furnishings Limited', '2025-12-28', 10348))
+  voucher = parse_receipt('Date of Supply: 21/02/2026\nParticulars  Amount (Rs.)\n10000.00\n'
+                          'Total Amount: Rs. Ten Thousand Only\nSample Education Private Limited')
+  self.assertEqual((str(voucher.fields.expense_date), voucher.fields.amount), ('2026-02-21', 10000))
+  till = parse_receipt('Date:06-11-2025\nTotal Qty       Grand Total\n  1     INR 1,999.00\nCash 2,000.00')
+  self.assertEqual(till.fields.amount, 1999)
+  courier = parse_receipt('Invoice Date: 30-Apr-2025\nTotal Amount % 293.34\n'
+                          'Discount Amount -€0.00\nGSTIN: 29AAGCR8772D1ZY')
+  self.assertEqual((str(courier.fields.expense_date), courier.fields.amount), ('2025-04-30', 293.34))
+
+ def test_azure_receipt_provider_validates_confidence_currency_and_polling_origin(self):
+  fields = {
+      'MerchantName': {'confidence': .96, 'valueString': 'Example Store'},
+      'TransactionDate': {'confidence': .6, 'valueDate': '2025-09-30'},
+      'Total': {'confidence': .98, 'valueCurrency': {'amount': 600, 'currencyCode': 'INR'}},
+  }
+  payload = {'status':'succeeded', 'analyzeResult':{'documents':[{'fields':fields}]}}
+  def transport(request):
+   if request.method == 'POST':
+    self.assertEqual(request.content, b'sample')
+    return httpx.Response(202, headers={'Operation-Location':'https://example.test/result'})
+   return httpx.Response(200, json=payload)
+  config = {'AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT':'https://example.test',
+            'AZURE_DOCUMENT_INTELLIGENCE_KEY':'test'}
+  with patch.dict(os.environ, config):
+   preview = asyncio.run(extract_azure(b'sample', transport=httpx.MockTransport(transport)))
+   with self.assertRaises(ValueError):
+    asyncio.run(extract_azure(b'sample', transport=httpx.MockTransport(lambda request:
+     httpx.Response(202, headers={'Operation-Location':'https://different.test/result'}))))
+  self.assertEqual(preview.fields.amount, 600)
+  self.assertIsNone(preview.fields.expense_date)
+  fields['Total']['valueCurrency']['currencyCode'] = 'GBP'
+  self.assertIsNone(normalize_result(payload).fields.amount)
+
+ def test_retail_invoice_reads_invoice_value_but_excludes_tax_total(self):
+  preview = parse_receipt(
+   'Example Retail Limited (trading as Example)\nTAX INVOICE\n'
+   'Date and Time:   30/09/2025 07:01 PM    Shipping information\n'
+   'Payment Mode:  Pre-Paid    Invoice Value :    INR.12999.0\n'
+   'Total Tax Amount: INR.1982.90'
+  )
+  self.assertEqual((preview.fields.merchant, preview.fields.amount, str(preview.fields.expense_date)),
+                   ('Example Retail Limited (trading as Example)', 12999, '2025-09-30'))
+
+ def test_receipt_image_layout_fallback_and_watermarked_headers(self):
+  primary = 'SAMPLE ONLY - NOT VALID\nSample Fuel Station\nPune, India\nFUEL RECEIPT\nDate\nCurrency'
+  fallback = primary.split('\nDate')[0] + '\nDate 2026-11-21\nTOTAL INR 1,254.00'
+  with patch('app.ai.receipt_extraction.run_text', side_effect=[primary, fallback]):
+   result = extract_receipt(b'image', '.jpg').fields
+  self.assertEqual((result.merchant, result.amount, str(result.expense_date), result.category),
+                   ('Sample Fuel Station', 1254, '2026-11-21', 'Fuel'))
+  hotel = parse_receipt('SAMPLE ONLY - NOT VALID\nSample Hotel\nMumbai, India\nLODGING RECEIPT\nDate 2026-11-20\nTOTAL INR 7,952.00')
+  self.assertEqual((hotel.fields.merchant, hotel.fields.category), ('Sample Hotel', 'Hotel'))
+  for heading, category in [('MEAL RECEIPT', 'Meals'), ('TRANSPORT RECEIPT', 'Ground transport'),
+                            ('RAIL TRAVEL RECEIPT', 'Rail travel'), ('COFFEE RECEIPT', 'Meals')]:
+   with self.subTest(heading=heading):
+    self.assertEqual(parse_receipt(heading).fields.category, category)
+  self.assertIsNone(parse_receipt('GENERIC RECEIPT').fields)
+
+ def test_receipt_preview_handles_split_fields_and_retries_unusable_pdf_text(self):
+  ocr_text = 'Supplier: Maple Cafe\nInvoice No. 19  Bill Date: 22 Nov 2026\nNet Payable\nINR 500.25'
+  def read_text(command, *args):
+   if command == 'pdftotext':
+    return 'Scanned document'
+   if command == 'pdftoppm':
+    Path(args[-1] + '-1.png').touch()
+    Path(args[-1] + '-2.png').touch()
+    return ''
+   return ocr_text if args[0].endswith('-1.png') else 'Thank you'
+  with patch('app.ai.receipt_extraction.run_text', side_effect=read_text) as run:
+   preview = extract_receipt(b'%PDF-1.4', '.pdf')
+  self.assertEqual([call.args[0] for call in run.call_args_list], ['pdftotext', 'pdftoppm', 'tesseract', 'tesseract'])
+  self.assertEqual((preview.fields.merchant, str(preview.fields.expense_date), preview.fields.amount),
+                   ('Maple Cafe', '2026-11-22', 500.25))
+  self.assertIn('No readable text', parse_receipt('').warning)
+  self.assertIn('Receipt text was found', parse_receipt('Unrecognized header').warning)
+  invoice = parse_receipt('11/24/26, 9:37 AM Sample Store\nGSTIN\nINVOICE NO. X349 22/11/2026 20:47:55\nCGST SGST\nTotal Invoice Amount: 698.00\nTotal Received Amount 698.00')
+  self.assertEqual((invoice.fields.merchant, str(invoice.fields.expense_date), invoice.fields.amount),
+                   ('Sample Store', '2026-11-22', 698))
+
+ def test_receipt_parser_uses_the_total_and_leaves_uncertain_values_empty(self):
+  receipt = 'Maple Cafe\nReceipt date: 22/11/2026\nSubtotal INR 460.00\nGrand Total INR 500.25'
+  fields = parse_receipt(receipt).fields
+  self.assertEqual((fields.merchant, str(fields.expense_date), fields.amount),
+                   ('Maple Cafe', '2026-11-22', 500.25))
+  self.assertIsNone(parse_receipt(receipt + '\nTotal paid INR 600').fields.amount)
+  self.assertIsNone(parse_receipt(receipt.replace('INR', '')).fields.amount)
+  foreign = parse_receipt(receipt.replace('INR', 'USD'))
+  self.assertIsNone(foreign.fields.amount)
+  self.assertIn('Foreign currency', foreign.warning)
+
  def test_receipt_preview_is_read_only_and_matches_fixture_content(self):
   fixture = Path(__file__).resolve().parents[1] / 'app' / 'demo_receipts' / 'lemon-tree-demo.pdf'
-  with TestClient(app) as client, patch.dict(os.environ, {'AI_MODE':'mock','AI_ENABLED':'true'}):
+  with TestClient(app) as client, patch.dict(os.environ, {'RECEIPT_EXTRACTION_MODE':'mock','AI_ENABLED':'true'}):
    headers = {'X-Demo-User':'aarav@northstar.demo'}
    before = client.get('/expenses', headers=headers).json()
    response = client.post('/ai/receipt-preview', headers=headers,
                           files={'file': ('renamed.pdf', fixture.read_bytes(), 'application/pdf')})
    self.assertEqual(response.status_code, 200, response.text)
-   self.assertEqual(response.json(), {'provider':'mock', 'fields':{
+   self.assertEqual(response.json(), {'provider':'mock', 'warning':None, 'fields':{
        'merchant':'Lemon Tree', 'amount':12600, 'expense_date':'2026-11-16', 'category':'Hotel'}})
    response = client.post('/ai/receipt-preview', headers=headers,
                           files={'file': (fixture.name, b'%PDF-1.4\nunknown', 'application/pdf')})
@@ -25,7 +191,7 @@ class AIFoundation(unittest.TestCase):
    self.assertEqual(client.post('/ai/receipt-preview', headers=headers, files=bad_file).status_code, 400)
    self.assertEqual(client.post('/ai/receipt-preview', headers={'X-Demo-User':'unknown'},
                                 files=bad_file).status_code, 401)
-   with patch.dict(os.environ, {'AI_MODE':'rag'}):
+   with patch.dict(os.environ, {'AI_ENABLED':'false'}):
     self.assertEqual(client.post('/ai/receipt-preview', headers=headers, files=bad_file).status_code, 503)
    self.assertEqual(client.get('/expenses', headers=headers).json(), before)
 

@@ -7,15 +7,17 @@ from pydantic import BaseModel, Field
 
 
 class ReceiptFields(BaseModel):
-    merchant: str = Field(min_length=1, max_length=255)
-    amount: float = Field(gt=0, allow_inf_nan=False)
-    expense_date: date
-    category: Literal['Meals', 'Ground transport', 'Hotel', 'Airfare', 'Office supplies', 'Other']
+    merchant: str | None = Field(default=None, min_length=1, max_length=255)
+    amount: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    expense_date: date | None = None
+    category: Literal['Meals', 'Ground transport', 'Hotel', 'Fuel', 'Rail travel', 'Airfare', 'Office supplies', 'Other'] | None = None
 
 
 class ReceiptPreview(BaseModel):
-    provider: Literal['mock'] = 'mock'
+    provider: Literal['mock', 'local', 'azure'] = 'mock'
     fields: ReceiptFields | None = None
+    warning: str | None = None
+    no_document_match: bool = Field(default=False, exclude=True)
 
 
 def fixture_preview(content: bytes) -> ReceiptPreview:

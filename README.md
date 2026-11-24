@@ -25,7 +25,7 @@ The database is seeded automatically on API startup. The demo identity is select
 
 - Travel requests with seeded flight/hotel options, estimated cost, and pre-approval.
 - Policy engine with role/department/project limits, receipt threshold, and soft/hard flags.
-- Expense submission with receipt upload and editable OCR-style extracted fields (mock extraction).
+- Expense submission with receipt upload and editable fields filled by local text extraction and OCR.
 - Conditional approval steps (manager then finance when required), comments, and audit history.
 - Finance dashboard, exception list, CSV export, mocked card feed, and accounting export.
 - Seeded company, employees, managers, departments, projects, policies, travel requests, and expenses.
@@ -35,6 +35,18 @@ The database is seeded automatically on API startup. The demo identity is select
 This is a runnable MVP, not a production deployment. Before production, add SSO/OIDC, server-side authorization, migrations, malware scanning and private object storage for receipts, immutable audit storage, idempotent integrations, rate limiting, CSRF protection if cookie auth is used, and real accounting/card/booking providers. The demo role selector sends `X-Demo-Role` and `X-Demo-User` headers and must be replaced.
 
 ## v1.3 AI foundation
+
+### Receipt provider evaluation
+
+Local extraction remains the default. To opt in to Azure Document Intelligence and send receipt files to its prebuilt receipt model, set `RECEIPT_EXTRACTION_MODE=azure` and configure `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` and `AZURE_DOCUMENT_INTELLIGENCE_KEY` in the local `.env`. Recreate the API container to apply the settings. Keep credentials out of version control.
+
+Use `RECEIPT_EXTRACTION_MODE=azure-invoice` to process formal invoices with Azure's prebuilt invoice model. The benchmark also accepts `azure-invoice` as a provider argument. Both Azure modes suggest categories from extracted text using TripLedger's rules. A no-document response triggers local OCR. A multiple-document response asks for one document at a time.
+
+The Azure pilot fills fields only when they meet initial confidence thresholds (0.85 for merchant and date, 0.90 for total). It requires an explicit INR currency code before filling the amount. Calibrate these thresholds on labeled receipts before using the provider as the default.
+
+From the backend directory, run `python benchmark_receipts.py local /path/to/expected-extraction.json` and `python benchmark_receipts.py azure /path/to/expected-extraction.json` against the same anonymized set. The Azure command sends the listed receipts to the configured endpoint and requires the Azure variables in the process environment. Each manifest entry contains `file`, `merchant`, `date` (ISO), `currency`, and `total`. The benchmark compares merchant, date, and the amount that would be filled into the INR form. It counts wrong values, blanks, and extraction errors separately.
+
+New receipts are processed inside the API container by Poppler and English Tesseract. Receipt preview reads PDF text from the first two pages and falls back to OCR on those pages if the text yields no usable fields. PNG and JPEG uploads use OCR directly. Rebuild the API image after changing extraction dependencies. Set `RECEIPT_EXTRACTION_MODE=mock` to preview only the bundled demo receipts. The preview leaves ambiguous values for manual entry and fills an amount only when it detects INR or Indian GST invoice markers and an unambiguous total.
 
 Copy `.env.example` to `.env` if custom settings are needed. Run `docker compose up --build` without deleting volumes. The AI Assistant defaults to mock mode: two read-only tasks (general expense policy guidance and scoped expense totals), with session-only messages. Free-text is passed to real providers but ignored by the mock. No AI action writes to the database. AI failure returns 503; regular workflows remain independent. `/ai/health` reports configuration, not remote liveness.
 

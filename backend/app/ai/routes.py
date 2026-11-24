@@ -1,12 +1,17 @@
 import logging, os, time, uuid
+from subprocess import SubprocessError
 from typing import Literal
+import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from starlette.concurrency import run_in_threadpool
 from ..database import get_db
 from ..receipts import read_receipt
 from .contracts import AIRequest, AIResponse, ExpenseReport, ReportFilters
 from .actions import build_context, build_expense_report
 from .providers import get_provider
 from .receipt_preview import ReceiptPreview, fixture_preview
+from .receipt_extraction import extract_receipt
+from .azure_receipts import AZURE_MODELS, extract_azure
 
 logger = logging.getLogger(__name__)
 def make_router(current_user):
@@ -42,10 +47,48 @@ def make_router(current_user):
 
     @router.post('/receipt-preview', response_model=ReceiptPreview)
     async def receipt_preview(file: UploadFile = File(...), user=Depends(current_user)):
-        if os.getenv('AI_ENABLED', 'true').lower() != 'true' or os.getenv('AI_MODE', 'mock') != 'mock':
-            raise HTTPException(503, 'Demo receipt preview is unavailable. Enter expense details manually.')
-        content, _ = await read_receipt(file)
-        return fixture_preview(content)
+        if os.getenv('AI_ENABLED', 'true').lower() != 'true':
+            raise HTTPException(503, 'Receipt preview is unavailable. Enter expense details manually.')
+        content, extension = await read_receipt(file)
+        mode = os.getenv('RECEIPT_EXTRACTION_MODE', 'local')
+        if mode == 'mock':
+            return fixture_preview(content)
+        if mode in AZURE_MODELS:
+            try:
+                preview = await extract_azure(content, mode=mode)
+            except (httpx.HTTPError, TimeoutError, ValueError):
+                logger.warning('Azure receipt extraction failed')
+            else:
+                fields = preview.fields
+                needs_details = fields is not None and fields.amount is not None and (
+                    fields.merchant is None or fields.expense_date is None
+                )
+                if preview.no_document_match or needs_details:
+                    try:
+                        fallback = await run_in_threadpool(extract_receipt, content, extension)
+                    except (OSError, SubprocessError):
+                        logger.warning('Local receipt fallback failed')
+                    else:
+                        if preview.no_document_match and fallback.fields:
+                            return fallback
+                        if (needs_details and fallback.fields
+                                and fallback.fields.amount == fields.amount
+                                and (fields.expense_date is None or fallback.fields.expense_date is None
+                                     or fields.expense_date == fallback.fields.expense_date)
+                                and (fields.merchant is None or fallback.fields.merchant is None
+                                     or fields.merchant.casefold() == fallback.fields.merchant.casefold())):
+                            fields.merchant = fields.merchant or fallback.fields.merchant
+                            fields.expense_date = fields.expense_date or fallback.fields.expense_date
+                return preview
+        if mode == 'local':
+            fixture = fixture_preview(content)
+            if fixture.fields:
+                return fixture
+            try:
+                return await run_in_threadpool(extract_receipt, content, extension)
+            except (OSError, SubprocessError):
+                logger.warning('Local receipt extraction failed', exc_info=False)
+        raise HTTPException(503, 'Receipt preview is unavailable. Enter expense details manually.')
 
     @router.post('/execute', response_model=AIResponse)
     async def execute(request: AIRequest, db=Depends(get_db), user=Depends(current_user)):

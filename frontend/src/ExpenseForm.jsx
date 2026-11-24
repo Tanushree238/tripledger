@@ -1,14 +1,14 @@
 import React, {useEffect, useRef, useState} from 'react';
 import {Upload} from 'lucide-react';
 
-const categories = ['Meals', 'Ground transport', 'Hotel', 'Airfare', 'Office supplies', 'Other'];
+const categories = ['Meals', 'Ground transport', 'Hotel', 'Fuel', 'Rail travel', 'Airfare', 'Office supplies', 'Other'];
 
 export default function ExpenseForm({projects, api, toast, submitDone}) {
   const [fields, setFields] = useState({
     project_code: projects[0]?.code || '',
-    category: 'Meals',
+    category: 'Other',
     merchant: '',
-    expense_date: '2026-11-21',
+    expense_date: '',
     amount: '',
     description: '',
   });
@@ -18,6 +18,7 @@ export default function ExpenseForm({projects, api, toast, submitDone}) {
   const [savedExpense, setSavedExpense] = useState(null);
   const request = useRef(null);
   const editedDuringPreview = useRef(new Set());
+  const appliedPreview = useRef({});
 
   useEffect(() => () => request.current?.abort(), []);
 
@@ -25,6 +26,7 @@ export default function ExpenseForm({projects, api, toast, submitDone}) {
     value: fields[name],
     onChange: event => {
       editedDuringPreview.current.add(name);
+      delete appliedPreview.current[name];
       const value = event.target.value;
       setFields(previous => ({...previous, [name]: value}));
     },
@@ -34,6 +36,9 @@ export default function ExpenseForm({projects, api, toast, submitDone}) {
     request.current?.abort();
     const input = event.target;
     const file = input.files[0];
+    const previousValues = appliedPreview.current;
+    setFields(previous => ({...previous, ...previousValues}));
+    appliedPreview.current = {};
     setReceipt(file || null);
     setMessage('');
     if (!file || savedExpense !== null) return;
@@ -43,17 +48,19 @@ export default function ExpenseForm({projects, api, toast, submitDone}) {
     editedDuringPreview.current.clear();
     const body = new FormData();
     body.append('file', file);
-    setMessage('Checking the receipt for demo suggestions…');
+    setMessage('Reading receipt details…');
     try {
       const result = await api('/ai/receipt-preview', {method: 'POST', body, signal: controller.signal});
       if (controller.signal.aborted) return;
       if (result.fields) {
         const suggestions = Object.fromEntries(Object.entries(result.fields)
-          .filter(([name]) => !editedDuringPreview.current.has(name)));
+          .filter(([name, value]) => value != null && !editedDuringPreview.current.has(name)));
+        appliedPreview.current = Object.fromEntries(Object.keys(suggestions)
+          .map(name => [name, Object.hasOwn(previousValues, name) ? previousValues[name] : fields[name]]));
         setFields(previous => ({...previous, ...suggestions}));
-        setMessage('Receipt details filled in. Edit them if needed.');
+        setMessage(result.warning || 'Review the filled fields and enter any missing details.');
       } else {
-        setMessage('Enter the receipt details manually.');
+        setMessage(result.warning || 'Enter the receipt details manually.');
       }
     } catch (error) {
       if (controller.signal.aborted) return;
@@ -97,7 +104,7 @@ export default function ExpenseForm({projects, api, toast, submitDone}) {
   return <form onSubmit={submit}>
     <div className="form-grid">
       <label className="field wide upload">
-        <Upload/><span><b>Attach receipt</b><small>{receipt?.name || 'PDF, JPG or PNG · optional demo preview'}</small></span>
+        <Upload/><span><b>Attach receipt</b><small>{receipt?.name || 'PDF, JPG or PNG · up to 10 MB'}</small></span>
         <input type="file" accept=".pdf,.jpg,.jpeg,.png" disabled={busy} onChange={selectReceipt}/>
       </label>
       {message && <div className="field wide ai-note" role="status">{message}</div>}
@@ -107,7 +114,7 @@ export default function ExpenseForm({projects, api, toast, submitDone}) {
         <option value="" disabled>Select a project</option>
         {projects.map(project => <option key={project.code} value={project.code}>{project.code} · {project.name}</option>)}
       </select></label>
-      <label className="field">Category<select {...field('category')}>
+      <label className="field">Category<select required {...field('category')}>
         {categories.map(category => <option key={category}>{category}</option>)}
       </select></label>
       <label className="field wide">Merchant<input required pattern=".*\S.*" {...field('merchant')} /></label>
