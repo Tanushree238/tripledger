@@ -8,6 +8,7 @@ from sqlalchemy import func
 from .database import Base, engine, get_db, SessionLocal
 from . import models as m, schemas as s
 from .seed import seed, upgrade_demo
+from .receipts import read_receipt
 from .policy import policy_for, refresh, receipt_file, receipt_requests, evaluate, snapshot
 
 app = FastAPI(title="TripLedger API", version="1.3.0")
@@ -103,10 +104,7 @@ async def upload_receipt(item_id:int, file:UploadFile=File(...), db:Session=Depe
     x=db.query(m.Expense).filter_by(id=item_id).first()
     if not x or x.employee_id!=user.id: raise HTTPException(404,"Expense not found")
     if x.status not in ("draft","pending_manager","pending_finance"): raise HTTPException(400,"Expense is closed")
-    content=await file.read(10*1024*1024+1)
-    ext=Path(file.filename or "receipt.bin").suffix.lower()
-    signatures={".pdf":b"%PDF-",".png":b"\x89PNG\r\n\x1a\n",".jpg":b"\xff\xd8",".jpeg":b"\xff\xd8"}
-    if ext not in signatures or not content.startswith(signatures[ext]) or len(content)>10*1024*1024: raise HTTPException(400,"Use a valid PDF, PNG or JPEG under 10 MB")
+    content,ext=await read_receipt(file)
     name=f"{uuid.uuid4().hex}{ext}"
     (UPLOAD_DIR/name).write_bytes(content)
     x.receipt_path=name
