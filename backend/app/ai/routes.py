@@ -1,10 +1,12 @@
 import logging, os, time, uuid
 from typing import Literal
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from ..database import get_db
+from ..receipts import read_receipt
 from .contracts import AIRequest, AIResponse, ExpenseReport, ReportFilters
 from .actions import build_context, build_expense_report
 from .providers import get_provider
+from .receipt_preview import ReceiptPreview, fixture_preview
 
 logger = logging.getLogger(__name__)
 def make_router(current_user):
@@ -37,6 +39,13 @@ def make_router(current_user):
                 period_end=period_end, department=department, category=category, scope=scope))
         except PermissionError:
             raise HTTPException(403, 'Action not permitted')
+
+    @router.post('/receipt-preview', response_model=ReceiptPreview)
+    async def receipt_preview(file: UploadFile = File(...), user=Depends(current_user)):
+        if os.getenv('AI_ENABLED', 'true').lower() != 'true' or os.getenv('AI_MODE', 'mock') != 'mock':
+            raise HTTPException(503, 'Demo receipt preview is unavailable. Enter expense details manually.')
+        content, _ = await read_receipt(file)
+        return fixture_preview(content)
 
     @router.post('/execute', response_model=AIResponse)
     async def execute(request: AIRequest, db=Depends(get_db), user=Depends(current_user)):

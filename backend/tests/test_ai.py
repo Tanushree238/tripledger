@@ -1,12 +1,34 @@
 import asyncio, os, unittest
 from unittest.mock import patch
 import httpx
+from pathlib import Path
 from test_release import app
 from fastapi.testclient import TestClient
 from app.ai.providers import HTTPProvider
 from app.ai.contracts import AIRequest, Context
 
 class AIFoundation(unittest.TestCase):
+ def test_receipt_preview_is_read_only_and_matches_fixture_content(self):
+  fixture = Path(__file__).resolve().parents[1] / 'app' / 'demo_receipts' / 'lemon-tree-demo.pdf'
+  with TestClient(app) as client, patch.dict(os.environ, {'AI_MODE':'mock','AI_ENABLED':'true'}):
+   headers = {'X-Demo-User':'aarav@northstar.demo'}
+   before = client.get('/expenses', headers=headers).json()
+   response = client.post('/ai/receipt-preview', headers=headers,
+                          files={'file': ('renamed.pdf', fixture.read_bytes(), 'application/pdf')})
+   self.assertEqual(response.status_code, 200, response.text)
+   self.assertEqual(response.json(), {'provider':'mock', 'fields':{
+       'merchant':'Lemon Tree', 'amount':12600, 'expense_date':'2026-11-16', 'category':'Hotel'}})
+   response = client.post('/ai/receipt-preview', headers=headers,
+                          files={'file': (fixture.name, b'%PDF-1.4\nunknown', 'application/pdf')})
+   self.assertIsNone(response.json()['fields'])
+   bad_file = {'file': ('invalid.pdf', b'invalid', 'application/pdf')}
+   self.assertEqual(client.post('/ai/receipt-preview', headers=headers, files=bad_file).status_code, 400)
+   self.assertEqual(client.post('/ai/receipt-preview', headers={'X-Demo-User':'unknown'},
+                                files=bad_file).status_code, 401)
+   with patch.dict(os.environ, {'AI_MODE':'rag'}):
+    self.assertEqual(client.post('/ai/receipt-preview', headers=headers, files=bad_file).status_code, 503)
+   self.assertEqual(client.get('/expenses', headers=headers).json(), before)
+
  def test_scopes_and_validation(self):
   with TestClient(app) as c, patch.dict(os.environ, {'AI_MODE':'mock','AI_ENABLED':'true'}):
    def run(name, task='expense_summary'):
