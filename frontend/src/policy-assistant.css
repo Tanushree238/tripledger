@@ -1,0 +1,41 @@
+.policy-chat { max-width: 850px; margin-inline: auto; }
+.policy-chat header > span { color: #6258cf; font-weight: 700; }
+.policy-chat-intro { padding: 2rem 0; text-align: center; }
+.policy-chat-intro > svg { color: #6258cf; }
+.policy-chat-intro h2 { display: block; margin: .8rem 0 1rem; font-size: 1.25rem; }
+.policy-prompts { display: flex; flex-wrap: wrap; justify-content: center; gap: .5rem; }
+.policy-messages { display: grid; gap: 1rem; }
+.policy-turn { display: grid; justify-items: start; gap: .5rem; }
+.policy-turn .policy-question {
+  justify-self: end;
+  max-width: 85%;
+  background: #eeebff;
+  color: #302562;
+  padding: .7rem 1rem;
+  border-radius: 14px 14px 4px 14px;
+  overflow-wrap: anywhere;
+  margin: 0;
+}
+.policy-turn .air-answer { max-width: 90%; margin: 0; overflow-wrap: anywhere; }
+.policy-turn .air-answer p { color: #30354b; margin: 0 0 .5rem; }
+.policy-turn .air-answer button { margin: .5rem 0; text-align: left; }
+.policy-composer { display: flex; align-items: end; gap: .6rem; margin-top: 1.25rem; }
+.policy-composer textarea {
+  flex: 1;
+  min-width: 0;
+  resize: vertical;
+  font: inherit;
+  padding: .7rem;
+  border: 1px solid #d8d5e9;
+  border-radius: 9px;
+}
+.air-insight > div { flex: 1; min-width: 0; }
+.air-insight .air-recommendation { color: #30354b; font-weight: 600; }
+.air-insight .air-text-button { margin-top: .5rem; padding-left: 0; }
+.air-insight small { color: #666b80; }
+.policy-followups { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1rem; }
+.policy-provider { display: block; margin-top: .35rem; }
+.policy-metrics { display: flex; flex-wrap: wrap; gap: .75rem 1.5rem; margin: 0 0 .75rem; }
+.policy-metrics dt { color: #525970; font-size: .75rem; }
+.policy-metrics dd { margin: .25rem 0 0; font-size: 1.15rem; font-weight: 800; }
+.air-insight .insight-type { color: #6355bc; font-weight: 700; }

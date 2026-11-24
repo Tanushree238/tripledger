@@ -1,5 +1,6 @@
 import logging, os, time, uuid
-from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import Literal
+from fastapi import APIRouter, Depends, HTTPException
 from ..database import get_db
 from .contracts import AIRequest, AIResponse, ExpenseReport, ReportFilters
 from .actions import build_context, build_expense_report
@@ -14,10 +15,15 @@ def make_router(current_user):
         try: get_provider(); configured = True
         except ValueError: configured = False
         return {'enabled': enabled, 'configured': configured, 'mode': os.getenv('AI_MODE','mock'), 'tasks': ['expense_summary','policy_guidance']}
+    @router.get('/policy-summary')
+    def policy_summary(db=Depends(get_db), user=Depends(current_user)):
+        return build_context(db, user).policies
+
     @router.get('/expense-report', response_model=ExpenseReport)
     def expense_report(db=Depends(get_db), user=Depends(current_user),
                        period_start: str | None = None, period_end: str | None = None,
-                       department: str | None = None, category: str | None = None):
+                       department: str | None = None, category: str | None = None,
+                       scope: Literal['visible', 'personal'] = 'visible'):
         # Report is deterministic and available independently of the LLM provider.
         from datetime import date
         for value in (period_start, period_end):
@@ -28,7 +34,7 @@ def make_router(current_user):
             raise HTTPException(422, 'Start date must not exceed end date')
         try:
             return build_expense_report(db, user, ReportFilters(period_start=period_start,
-                period_end=period_end, department=department, category=category))
+                period_end=period_end, department=department, category=category, scope=scope))
         except PermissionError:
             raise HTTPException(403, 'Action not permitted')
 

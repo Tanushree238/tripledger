@@ -8,7 +8,7 @@ from sqlalchemy import func
 from .database import Base, engine, get_db, SessionLocal
 from . import models as m, schemas as s
 from .seed import seed, upgrade_demo
-from .policy import policy_for, refresh, receipt_file, evaluate, snapshot
+from .policy import policy_for, refresh, receipt_file, receipt_requests, evaluate, snapshot
 
 app = FastAPI(title="TripLedger API", version="1.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -34,9 +34,14 @@ def item_dict(x):
     d["employee"] = x.employee.name if hasattr(x, "employee") and x.employee else ""
     if isinstance(x,m.Expense):
         from sqlalchemy.orm import object_session
-        row=object_session(x).query(m.PolicyEvaluation).filter_by(expense_id=x.id).order_by(m.PolicyEvaluation.id.desc()).first()
+        db=object_session(x)
+        row=db.query(m.PolicyEvaluation).filter_by(expense_id=x.id).order_by(m.PolicyEvaluation.id.desc()).first()
         d["policy_evaluation"]=json.loads(row.payload) if row else None
         d["receipt_path"]=x.receipt_path if receipt_file(x) else None
+        d["receipt_requested"] = (
+            not d["receipt_path"]
+            and receipt_requests(db).filter(m.AuditLog.item_id == x.id).first() is not None
+        )
     return d
 
 def visible_query(db, user, model):
@@ -196,8 +201,8 @@ def accounting_export(user=Depends(current_user),db:Session=Depends(get_db)):
     return {"ok":True,"system":"MockBooks ERP","exported_records":count,"batch_id":f"MOCK-{uuid.uuid4().hex[:8].upper()}","message":"Approved expenses queued for accounting export."}
 
 
-def authorized_expense(db,user,item_id):
-    x=db.get(m.Expense,item_id)
+def authorized_expense(db,user,item_id,*,lock=False):
+    x=db.get(m.Expense,item_id,with_for_update=lock)
     if not x or not (user.role=='finance' or x.employee_id==user.id or (user.role=='manager' and x.employee.manager_id==user.id)): raise HTTPException(404,'Expense not found')
     return x
 
@@ -216,10 +221,13 @@ def reevaluate(item_id:int,db:Session=Depends(get_db),user=Depends(current_user)
 
 @app.post('/expenses/{item_id}/request-receipt')
 def request_receipt(item_id:int,db:Session=Depends(get_db),user=Depends(current_user)):
-    x=authorized_expense(db,user,item_id)
+    x=authorized_expense(db,user,item_id,lock=True)
     if user.role not in ('manager','finance') or x.employee_id==user.id: raise HTTPException(403,'Reviewer required')
     if receipt_file(x) or not x.status.startswith('pending'): raise HTTPException(400,'Receipt request not applicable')
-    log(db,'expense',x.id,user,'receipt_requested','Please attach supporting receipt'); db.commit(); return {'ok':True}
+    if receipt_requests(db).filter(m.AuditLog.item_id == x.id).first() is None:
+        log(db,'expense',x.id,user,'receipt_requested','Please attach supporting receipt')
+    db.commit()
+    return {'ok':True}
 
 from .ai.routes import make_router
 app.include_router(make_router(current_user))
