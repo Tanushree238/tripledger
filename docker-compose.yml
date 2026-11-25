@@ -20,11 +20,12 @@ services:
       AI_ENABLED: ${AI_ENABLED:-true}
       AI_MODE: ${AI_MODE:-mock}
       AI_SERVICE_URL: ${AI_SERVICE_URL:-}
+      POLICY_AGENT_URL: ${POLICY_AGENT_URL:-http://host.docker.internal:8001}
       AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-10}
       RECEIPT_EXTRACTION_MODE: ${RECEIPT_EXTRACTION_MODE:-local}
       AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: ${AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT:-}
       AZURE_DOCUMENT_INTELLIGENCE_KEY: ${AZURE_DOCUMENT_INTELLIGENCE_KEY:-}
-    ports: ["8000:8000"]
+    ports: ["8080:8000"]
     volumes: ["uploads:/app/uploads"]
     depends_on:
       db:
@@ -33,7 +34,7 @@ services:
     build: ./frontend
     ports: ["5173:5173"]
     environment:
-      VITE_API_URL: http://localhost:8000
+      VITE_API_URL: http://localhost:8080
     depends_on: [api]
 volumes:
   pgdata:

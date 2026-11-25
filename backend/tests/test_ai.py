@@ -1,4 +1,5 @@
 import asyncio, os, unittest
+import json
 from unittest.mock import patch
 import httpx
 from pathlib import Path
@@ -10,6 +11,40 @@ from app.ai.receipt_extraction import extract_receipt, parse_receipt
 from app.ai.azure_receipts import extract_azure, normalize_result
 
 class AIFoundation(unittest.TestCase):
+ def test_policy_search_forwards_query_and_returns_evidence(self):
+  async_client = httpx.AsyncClient
+
+  def retrieve(request):
+   self.assertEqual(str(request.url), 'http://127.0.0.1:8001/api/v1/retrieve')
+   self.assertEqual(json.loads(request.content), {
+       'user_query': 'Mumbai hotel cap for l3?', 'top_k': 3, 'grade': 'L3',
+   })
+   return httpx.Response(200, json={'status': 'OK', 'results': [{
+       'chunk_id': 'hotel-1', 'policy_ref': 'HOTEL#1', 'title': 'Mumbai hotel cap',
+       'text': 'The January cap is INR 10,925.', 'rerank_score': 0.99,
+   }]})
+
+  with TestClient(app) as client, patch.dict(os.environ, {
+      'AI_ENABLED': 'true', 'POLICY_AGENT_URL': 'http://127.0.0.1:8001/',
+  }), patch('app.ai.routes.httpx.AsyncClient', side_effect=lambda **kwargs: async_client(
+      transport=httpx.MockTransport(retrieve), **kwargs,
+  )) as upstream:
+   payload = {'query': ' Mumbai hotel cap for l3? '}
+   with self.assertLogs('uvicorn.error.policy_search', level='INFO') as logs:
+    response = client.post('/ai/policy-search', json=payload)
+   self.assertEqual(response.status_code, 200, response.text)
+   self.assertEqual(response.json()['results'][0]['policy_ref'], 'HOTEL#1')
+   trace_id = response.json()['trace_id']
+   self.assertRegex(trace_id, r'^[0-9a-f]{32}$')
+   self.assertIn(f'trace={trace_id}', logs.output[0])
+   self.assertIn('grade=L3', logs.output[0])
+   self.assertIn('"rerank_score": 0.99', logs.output[0])
+   self.assertEqual(client.post('/ai/policy-search', json={'query': ' '}).status_code, 422)
+   self.assertEqual(client.post('/ai/policy-search', json=payload, headers={
+       'X-Demo-User': 'unknown',
+   }).status_code, 401)
+   self.assertEqual(upstream.call_count, 1)
+
  def test_policy_evaluation_rejects_invalid_stay_order(self):
   with TestClient(app) as client, patch.dict(os.environ, {'AI_ENABLED': 'true'}):
    for check_out in ('2026-11-14', '2026-11-15'):

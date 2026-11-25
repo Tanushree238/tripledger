@@ -10,8 +10,8 @@ docker compose up --build
 ```
 
 - Web app: http://localhost:5173
-- API docs: http://localhost:8000/docs
-- API health: http://localhost:8000/health
+- API docs: http://localhost:8080/docs
+- API health: http://localhost:8080/health
 
 The database is seeded automatically on API startup. The demo identity is selected in the app's role switcher; this is intentionally a demo-only identity mechanism, not production authentication.
 
@@ -35,6 +35,29 @@ The database is seeded automatically on API startup. The demo identity is select
 This is a runnable MVP, not a production deployment. Before production, add SSO/OIDC, server-side authorization, migrations, malware scanning and private object storage for receipts, immutable audit storage, idempotent integrations, rate limiting, CSRF protection if cookie auth is used, and real accounting/card/booking providers. The demo role selector sends `X-Demo-Role` and `X-Demo-User` headers and must be replaced.
 
 ## v1.3 AI foundation
+
+### Policy Assistant search
+
+Start the indexed `TE-Policy-Agent` on port 8001. If TripLedger runs in
+Docker Desktop and the agent runs on the host, start the agent with
+`python -m uvicorn app.main:app --host 0.0.0.0 --port 8001` so the container
+can reach it. Compose defaults to `http://host.docker.internal:8001`.
+When running TripLedger directly on the host, start its API on port 8080.
+It defaults to `http://127.0.0.1:8001` for the agent. Override either default
+with `POLICY_AGENT_URL` when needed.
+
+In the Policy Assistant, try “What is the hotel limit for an L3 employee in
+Mumbai in January?” The browser sends the question to TripLedger's
+`POST /ai/policy-search` endpoint. TripLedger requests policy excerpts from
+the agent and displays them with their references.
+
+If the question mentions one distinct grade such as `L3`, TripLedger
+passes that grade as a search filter. Broad questions and questions
+comparing multiple grades search across grade bands.
+
+For the demo, run `docker compose logs -f api` in a second terminal.
+Each successful agent response appears on one `policy_search` line with
+the trace ID, grade filter, elapsed time, and full evidence JSON.
 
 ### Receipt provider evaluation
 

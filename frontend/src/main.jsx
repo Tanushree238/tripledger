@@ -1,5 +1,5 @@
 import React,{useEffect,useRef,useState} from 'react';import{createRoot}from'react-dom/client';import{Plane,Receipt,LayoutDashboard,CheckCircle2,Settings,Download,Plus,Search,Bell,ChevronDown,ArrowUpRight,Wallet,ShieldCheck,Clock3,Upload,Building2,Menu,X,FileText,History,RefreshCw}from'lucide-react';import'./style.css';import AI from './AI.jsx';import ExpenseForm from './ExpenseForm.jsx';
-const API=import.meta.env.VITE_API_URL||'http://localhost:8000';
+const API=import.meta.env.VITE_API_URL||'http://localhost:8080';
 const DEFAULT_PROFILE='aarav@northstar.demo';
 const PROFILE_KEY='tripledger.demoProfile';
 const TAB_KEY='tripledger.workspaceTab';

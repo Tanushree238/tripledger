@@ -1,4 +1,6 @@
 import logging, os, time, uuid
+import json
+import re
 from subprocess import SubprocessError
 from typing import Literal
 import httpx
@@ -6,7 +8,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 from ..database import get_db
 from ..receipts import read_receipt
-from .contracts import AIRequest, AIResponse, ExpenseReport, ReportFilters
+from .contracts import AIRequest, AIResponse, ExpenseReport, PolicySearchRequest, PolicySearchResponse, ReportFilters
 from .actions import build_context, build_expense_report
 from .providers import get_provider
 from .policy_evaluation import PolicyDecision, PolicyEvaluationRequest, evaluate_demo
@@ -15,6 +17,9 @@ from .receipt_extraction import extract_receipt
 from .azure_receipts import AZURE_MODELS, extract_azure
 
 logger = logging.getLogger(__name__)
+policy_search_logger = logging.getLogger('uvicorn.error.policy_search')
+
+
 def make_router(current_user):
     router = APIRouter(prefix='/ai', tags=['AI'])
 
@@ -34,6 +39,38 @@ def make_router(current_user):
     @router.get('/policy-summary')
     def policy_summary(db=Depends(get_db), user=Depends(current_user)):
         return build_context(db, user).policies
+
+    @router.post('/policy-search', response_model=PolicySearchResponse)
+    async def policy_search(payload: PolicySearchRequest, user=Depends(current_user)):
+        if os.getenv('AI_ENABLED', 'true').lower() != 'true':
+            raise HTTPException(503, 'Policy search is disabled.')
+        agent_url = os.getenv('POLICY_AGENT_URL', 'http://127.0.0.1:8001').rstrip('/')
+        grades = set(re.findall(r'\bL[1-8]\b', payload.query.upper()))
+        agent_payload = {'user_query': payload.query, 'top_k': 3}
+        if len(grades) == 1:
+            agent_payload['grade'] = grades.pop()
+        trace = uuid.uuid4().hex
+        started = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+                response = await client.post(f'{agent_url}/api/v1/retrieve', json=agent_payload)
+                response.raise_for_status()
+                body = response.json()
+                result = PolicySearchResponse.model_validate(body)
+        except httpx.TimeoutException:
+            policy_search_logger.warning('policy_search trace=%s upstream_timeout', trace)
+            raise HTTPException(504, 'Policy search timed out. Try again.') from None
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+            policy_search_logger.warning(
+                'policy_search trace=%s upstream_failure=%s', trace, type(exc).__name__,
+            )
+            raise HTTPException(503, 'Policy search is unavailable. Try again shortly.') from None
+        policy_search_logger.info(
+            'policy_search trace=%s upstream_status=%s grade=%s elapsed_ms=%d response=%s',
+            trace, response.status_code, agent_payload.get('grade'),
+            (time.monotonic() - started) * 1000, json.dumps(body, ensure_ascii=False),
+        )
+        return {**result.model_dump(), 'trace_id': trace}
 
     @router.get('/expense-report', response_model=ExpenseReport)
     def expense_report(db=Depends(get_db), user=Depends(current_user),
