@@ -1,6 +1,7 @@
 import React, {useEffect, useRef, useState} from 'react';
 import {Plus, Send, Sparkles} from 'lucide-react';
 import './policy-assistant.css';
+import PolicyEvaluation from './PolicyEvaluation.jsx';
 
 const prompts = {
   receipt: 'What is my receipt threshold?',
@@ -109,7 +110,7 @@ export default function PolicyAssistant({api, onNavigate}) {
     }
   }
 
-  return <section className="air-panel policy-chat">
+  return <><PolicyEvaluation api={api}/><section className="air-panel policy-chat">
     <header className="air-row">
       <span>{health?.mode === 'mock' ? 'Demo mode · No live AI reasoning' : health?.mode || 'Policy guidance'}</span>
       <button className="outline" onClick={reset}><Plus size={16}/> New conversation</button>
@@ -160,5 +161,5 @@ export default function PolicyAssistant({api, onNavigate}) {
         onChange={event => setQuery(event.target.value)}/>
       <button className="air-submit" aria-label="Send question" disabled={!ready || busy || !query.trim()}><Send size={18}/></button>
     </form>
-  </section>;
+  </section></>;
 }

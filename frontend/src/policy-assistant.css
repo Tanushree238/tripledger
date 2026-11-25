@@ -39,3 +39,7 @@
 .policy-metrics dt { color: #525970; font-size: .75rem; }
 .policy-metrics dd { margin: .25rem 0 0; font-size: 1.15rem; font-weight: 800; }
 .air-insight .insight-type { color: #6355bc; font-weight: 700; }
+.policy-evaluation { max-width: 850px; margin-inline: auto; }
+.policy-evaluation .form-grid { margin-top: 1rem; }
+.policy-evaluation .form-actions { margin-top: 1rem; }
+.policy-evaluation [aria-invalid="true"] { border-color: #a14e0a; }

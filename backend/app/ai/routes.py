@@ -9,6 +9,7 @@ from ..receipts import read_receipt
 from .contracts import AIRequest, AIResponse, ExpenseReport, ReportFilters
 from .actions import build_context, build_expense_report
 from .providers import get_provider
+from .policy_evaluation import PolicyDecision, PolicyEvaluationRequest, evaluate_demo
 from .receipt_preview import ReceiptPreview, fixture_preview
 from .receipt_extraction import extract_receipt
 from .azure_receipts import AZURE_MODELS, extract_azure
@@ -16,6 +17,14 @@ from .azure_receipts import AZURE_MODELS, extract_azure
 logger = logging.getLogger(__name__)
 def make_router(current_user):
     router = APIRouter(prefix='/ai', tags=['AI'])
+
+    @router.post('/policy-evaluations', response_model=PolicyDecision)
+    def evaluate_policy(request: PolicyEvaluationRequest, user=Depends(current_user)):
+        if os.getenv('AI_ENABLED', 'true').lower() != 'true':
+            raise HTTPException(503, 'Policy evaluation is unavailable.')
+        decision = evaluate_demo(request)
+        logger.info('policy_evaluation request_id=%s decision=%s', decision.request_id, decision.decision_category)
+        return decision
     @router.get('/health')
     def health(user=Depends(current_user)):
         enabled = os.getenv('AI_ENABLED', 'true').lower() == 'true'
