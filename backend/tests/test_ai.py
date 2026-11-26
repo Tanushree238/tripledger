@@ -1,4 +1,5 @@
 import asyncio, os, unittest
+import json
 from unittest.mock import patch
 import httpx
 from pathlib import Path
@@ -10,6 +11,88 @@ from app.ai.receipt_extraction import extract_receipt, parse_receipt
 from app.ai.azure_receipts import extract_azure, normalize_result
 
 class AIFoundation(unittest.TestCase):
+ def test_policy_search_forwards_query_and_returns_evidence(self):
+  async_client = httpx.AsyncClient
+
+  def retrieve(request):
+   self.assertEqual(str(request.url), 'http://127.0.0.1:8001/api/v1/retrieve')
+   self.assertEqual(json.loads(request.content), {
+       'user_query': 'Mumbai hotel cap for l3?', 'top_k': 3, 'grade': 'L3',
+   })
+   return httpx.Response(200, json={'status': 'OK', 'results': [{
+       'chunk_id': 'hotel-1', 'policy_ref': 'HOTEL#1', 'title': 'Mumbai hotel cap',
+       'text': 'The January cap is INR 10,925.', 'rerank_score': 0.99,
+   }]})
+
+  with TestClient(app) as client, patch.dict(os.environ, {
+      'AI_ENABLED': 'true', 'POLICY_AGENT_URL': 'http://127.0.0.1:8001/',
+  }), patch('app.ai.routes.httpx.AsyncClient', side_effect=lambda **kwargs: async_client(
+      transport=httpx.MockTransport(retrieve), **kwargs,
+  )) as upstream:
+   payload = {'query': ' Mumbai hotel cap for l3? '}
+   with self.assertLogs('uvicorn.error.policy_search', level='INFO') as logs:
+    response = client.post('/ai/policy-search', json=payload)
+   self.assertEqual(response.status_code, 200, response.text)
+   self.assertEqual(response.json()['results'][0]['policy_ref'], 'HOTEL#1')
+   trace_id = response.json()['trace_id']
+   self.assertRegex(trace_id, r'^[0-9a-f]{32}$')
+   self.assertIn(f'trace={trace_id}', logs.output[0])
+   self.assertIn('grade=L3', logs.output[0])
+   self.assertIn('"rerank_score": 0.99', logs.output[0])
+   self.assertEqual(client.post('/ai/policy-search', json={'query': ' '}).status_code, 422)
+   self.assertEqual(client.post('/ai/policy-search', json=payload, headers={
+       'X-Demo-User': 'unknown',
+   }).status_code, 401)
+   self.assertEqual(upstream.call_count, 1)
+
+ def test_policy_evaluation_rejects_invalid_stay_order(self):
+  with TestClient(app) as client, patch.dict(os.environ, {'AI_ENABLED': 'true'}):
+   for check_out in ('2026-11-14', '2026-11-15'):
+    with self.subTest(check_out=check_out):
+     response = client.post('/ai/policy-evaluations', json={
+         'user_query': 'Can I claim this hotel expense?',
+         'structured_inputs': {'travel_dates': {'start_date': '2026-11-15', 'end_date': check_out}},
+     })
+     self.assertEqual(response.status_code, 422)
+     detail = response.json()['detail'][0]
+     self.assertEqual(detail['loc'][-1], 'end_date')
+     self.assertIn('Check-out must be after check-in.', detail['msg'])
+
+ def test_policy_evaluation_mock_reuses_session_and_returns_unique_request_ids(self):
+  headers = {'X-Demo-User': 'aarav@northstar.demo'}
+  payload = {'user_query': 'Can I claim a hotel?', 'structured_inputs': {
+      'travel_destination': 'Bengaluru', 'expense_amount': {'value': '18400', 'currency': 'INR'},
+  }}
+  with TestClient(app) as client, patch.dict(os.environ, {'AI_ENABLED': 'true'}):
+   before = client.get('/expenses', headers=headers).json()
+   first = client.post('/ai/policy-evaluations', headers=headers, json=payload)
+   self.assertEqual(first.status_code, 200, first.text)
+   first = first.json()
+   self.assertEqual(first['decision_category'], 'NEEDS_INFORMATION')
+   self.assertEqual(first['missing_required_fields'], ['travel_dates.start_date', 'travel_dates.end_date'])
+   payload['session_id'] = first['session_id']
+   payload['structured_inputs']['travel_dates'] = {'start_date': '2026-11-15', 'end_date': '2026-11-17'}
+   followup = client.post('/ai/policy-evaluations', headers=headers, json=payload).json()
+   self.assertEqual(followup['session_id'], first['session_id'])
+   self.assertNotEqual(followup['request_id'], first['request_id'])
+   self.assertEqual(followup['decision_category'], 'SOFT_FLAG')
+   self.assertEqual(followup['allowed_expense_amount'], {'value': '16000', 'currency': 'INR'})
+   self.assertEqual(followup['required_approval_level'], 'LINE_MANAGER')
+   for amount in ('1400', '16000'):
+    with self.subTest(amount=amount):
+     payload['structured_inputs']['expense_amount']['value'] = amount
+     within_limit = client.post('/ai/policy-evaluations', headers=headers, json=payload).json()
+     self.assertEqual(within_limit['decision_category'], 'WITHIN_LIMIT')
+     self.assertEqual(within_limit['allowed_expense_amount'], {'value': '16000', 'currency': 'INR'})
+     self.assertFalse(within_limit['requires_human_approval'])
+   payload['structured_inputs']['travel_destination'] = 'Other city'
+   review = client.post('/ai/policy-evaluations', headers=headers, json=payload).json()
+   self.assertEqual(review['decision_category'], 'HUMAN_REVIEW')
+   self.assertIsNone(review['allowed_expense_amount'])
+   self.assertEqual(client.get('/expenses', headers=headers).json(), before)
+   self.assertEqual(client.post('/ai/policy-evaluations', headers={'X-Demo-User': 'unknown'},
+                                json=payload).status_code, 401)
+
  def test_currency_codes_need_monetary_context(self):
   invoice = '3 CAD Hospitality LLP\nInvoice Date: 18 Dec 2023\nTotal ₹263.00'
   self.assertEqual(parse_receipt(invoice).fields.amount, 263)

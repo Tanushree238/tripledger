@@ -35,7 +35,15 @@
 .air-insight small { color: #666b80; }
 .policy-followups { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1rem; }
 .policy-provider { display: block; margin-top: .35rem; }
+.policy-excerpt-text { white-space: pre-wrap; }
+.policy-more-excerpts { margin: .75rem 0; }
+.policy-more-excerpts summary { cursor: pointer; font-weight: 600; }
+.policy-more-excerpts section { margin-top: .75rem; }
 .policy-metrics { display: flex; flex-wrap: wrap; gap: .75rem 1.5rem; margin: 0 0 .75rem; }
 .policy-metrics dt { color: #525970; font-size: .75rem; }
 .policy-metrics dd { margin: .25rem 0 0; font-size: 1.15rem; font-weight: 800; }
 .air-insight .insight-type { color: #6355bc; font-weight: 700; }
+.policy-evaluation { max-width: 850px; margin-inline: auto; }
+.policy-evaluation .form-grid { margin-top: 1rem; }
+.policy-evaluation .form-actions { margin-top: 1rem; }
+.policy-evaluation [aria-invalid="true"] { border-color: #a14e0a; }

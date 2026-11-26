@@ -1,14 +1,30 @@
 import React, {useEffect, useRef, useState} from 'react';
 import {Plus, Send, Sparkles} from 'lucide-react';
 import './policy-assistant.css';
+import PolicyEvaluation from './PolicyEvaluation.jsx';
 
 const prompts = {
   receipt: 'What is my receipt threshold?',
   expense_summary: 'Summarize visible expenses',
   exceptions: 'Which expenses need attention?',
   policy_guidance: 'Explain my expense policy',
+  policy_search: 'What is the hotel limit for an L3 employee in Mumbai in January?',
 };
 const money = new Intl.NumberFormat('en-IN', {style: 'currency', currency: 'INR', minimumFractionDigits: 0});
+
+function PolicyExcerpt({excerpt}) {
+  const heading = `[${excerpt.policy_ref}] ${excerpt.title}`;
+  const [firstLine] = excerpt.text.split('\n', 1);
+  const text = firstLine.trim() === heading && excerpt.text.length > firstLine.length
+    ? excerpt.text.slice(firstLine.length).trimStart()
+    : excerpt.text;
+
+  return <section>
+    <h3>{excerpt.title}</h3>
+    <small>{excerpt.policy_ref}</small>
+    <p className="policy-excerpt-text">{text}</p>
+  </section>;
+}
 
 function supportedTask(question) {
   const text = question.toLowerCase().replace(/[?.!]+$/, '');
@@ -33,7 +49,7 @@ export default function PolicyAssistant({api, onNavigate}) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const latest = useRef(null);
-  const ready = health?.enabled && health?.configured;
+  const ready = health?.enabled;
 
   useEffect(() => {
     const request = new AbortController();
@@ -87,14 +103,22 @@ export default function PolicyAssistant({api, onNavigate}) {
       } else if (health.mode === 'mock' && (task === 'receipt' || task === 'policy_guidance')) {
         const policies = await api('/ai/policy-summary', {signal: request.signal});
         answer = {policies, sources: policies.map(policy => policy.name), provider: 'deterministic'};
-      } else if (task || health.mode !== 'mock') {
+      } else if (task) {
         answer = await api('/ai/execute', {
           method: 'POST',
           signal: request.signal,
           body: JSON.stringify({task: task === 'receipt' ? 'policy_guidance' : task || 'policy_guidance', query: question}),
         });
       } else {
-        answer = {answer: 'Demo mode supports general expense policy, receipt thresholds, expense totals, and recorded exceptions. Choose a suggested question to get started.'};
+        const evidence = await api('/ai/policy-search', {
+          method: 'POST',
+          signal: request.signal,
+          body: JSON.stringify({query: question}),
+        });
+        answer = evidence.status === 'NO_POLICY_EVIDENCE' || !evidence.results.length
+          ? {answer: 'No matching policy excerpts were found. Try adding a city, expense type, or employee grade.'}
+          : {evidence: evidence.results};
+        answer.traceId = evidence.trace_id;
       }
       if (request.signal.aborted) return;
       setMessages(previous => [...previous, {question, task, ...answer}]);
@@ -109,9 +133,9 @@ export default function PolicyAssistant({api, onNavigate}) {
     }
   }
 
-  return <section className="air-panel policy-chat">
+  return <><PolicyEvaluation api={api}/><section className="air-panel policy-chat">
     <header className="air-row">
-      <span>{health?.mode === 'mock' ? 'Demo mode · No live AI reasoning' : health?.mode || 'Policy guidance'}</span>
+      <span>Policy Assistant</span>
       <button className="outline" onClick={reset}><Plus size={16}/> New conversation</button>
     </header>
     {!messages.length && <div className="policy-chat-intro">
@@ -140,9 +164,18 @@ export default function PolicyAssistant({api, onNavigate}) {
           {message.policies?.length === 0 && <p>No general expense policy applies to your profile.</p>}
           {message.expenses?.map(expense => <button className="air-text-button" key={expense.id}
             onClick={() => onNavigate(expense.id)}>{expense.merchant} · {expense.employee} · {expense.reason}</button>)}
+          {message.evidence?.length > 0 && <div aria-label="Sample policy excerpts">
+            <PolicyExcerpt excerpt={message.evidence[0]}/>
+            {message.evidence.length > 1 && <details className="policy-more-excerpts">
+              <summary>More policy excerpts ({message.evidence.length - 1})</summary>
+              {message.evidence.slice(1).map(excerpt => <PolicyExcerpt key={excerpt.chunk_id} excerpt={excerpt}/>)}
+            </details>}
+            <small className="policy-provider">Retrieved from the sample policy corpus</small>
+          </div>}
           {!!message.sources?.length && <small>Sources: {message.sources.join(', ')}</small>}
           {message.provider && <small className="policy-provider">{message.provider === 'deterministic' || message.provider === 'mock'
             ? 'Calculated from TripLedger records' : `AI-generated · ${message.provider}`}</small>}
+          {message.traceId && <small className="policy-provider">Trace ID <code>{message.traceId}</code></small>}
         </article>
       </div>)}
       {busy && <p role="status">Preparing a response…</p>}
@@ -160,5 +193,5 @@ export default function PolicyAssistant({api, onNavigate}) {
         onChange={event => setQuery(event.target.value)}/>
       <button className="air-submit" aria-label="Send question" disabled={!ready || busy || !query.trim()}><Send size={18}/></button>
     </form>
-  </section>;
+  </section></>;
 }
