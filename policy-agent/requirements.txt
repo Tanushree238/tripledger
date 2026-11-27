@@ -1,0 +1,15 @@
+
+openai
+python-dotenv
+pandas
+pydantic>=2,<3
+pytest
+fastapi
+uvicorn
+langgraph
+chromadb>=1,<2
+rank-bm25
+flashrank
+tenacity
+truststore
+httpx
