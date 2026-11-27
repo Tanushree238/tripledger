@@ -1,6 +1,11 @@
+x-build-args: &build-args
+  REGISTRY: ${REGISTRY:-}
+  PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+  NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org/}
+
 services:
   db:
-    image: postgres:16-alpine
+    image: ${REGISTRY:-}postgres:16-alpine
     environment:
       POSTGRES_DB: tripledger
       POSTGRES_USER: tripledger
@@ -12,15 +17,34 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+  policy-agent:
+    build:
+      context: ./policy-agent
+      args: *build-args
+    environment:
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-small-en-v1.5}
+    ports: ["8001:8001"]
+    volumes: ["chroma:/app/data/chroma_db"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
   api:
-    build: ./backend
+    build:
+      context: ./backend
+      args: *build-args
     environment:
       DATABASE_URL: postgresql+psycopg://tripledger:tripledger@db:5432/tripledger
       UPLOAD_DIR: /app/uploads
+      CORS_ORIGINS: http://localhost:${WEB_PORT:-5173}
       AI_ENABLED: ${AI_ENABLED:-true}
       AI_MODE: ${AI_MODE:-mock}
       AI_SERVICE_URL: ${AI_SERVICE_URL:-}
-      POLICY_AGENT_URL: ${POLICY_AGENT_URL:-http://host.docker.internal:8001}
+      POLICY_AGENT_URL: ${POLICY_AGENT_URL:-http://policy-agent:8001}
       AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-10}
       RECEIPT_EXTRACTION_MODE: ${RECEIPT_EXTRACTION_MODE:-local}
       AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: ${AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT:-}
@@ -31,11 +55,14 @@ services:
       db:
         condition: service_healthy
   web:
-    build: ./frontend
-    ports: ["5173:5173"]
+    build:
+      context: ./frontend
+      args: *build-args
+    ports: ["${WEB_PORT:-5173}:5173"]
     environment:
       VITE_API_URL: http://localhost:8080
     depends_on: [api]
 volumes:
   pgdata:
   uploads:
+  chroma:
