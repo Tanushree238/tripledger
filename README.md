@@ -38,16 +38,12 @@ This is a runnable MVP, not a production deployment. Before production, add SSO/
 
 ### Policy Assistant search
 
-The policy agent ships in this repo (`policy-agent/`) and starts with
-`docker compose up --build` as the `policy-agent` service on port 8001.
-Copy `.env.example` to `.env` and set `EMBEDDING_API_KEY` first: every
-policy search embeds the query live, so the agent refuses to start without
-it. On first start it builds the Chroma index from the bundled corpus
-(cached embeddings are reused) and keeps it in the `chroma` volume.
-Compose points TripLedger at `http://policy-agent:8001`. When running
-TripLedger directly on the host, start its API on port 8080 and the agent
-with `python -m uvicorn app.main:app --port 8001` inside `policy-agent/`;
-the API then defaults to `http://127.0.0.1:8001`. Override either default
+Start the indexed `TE-Policy-Agent` on port 8001. If TripLedger runs in
+Docker Desktop and the agent runs on the host, start the agent with
+`python -m uvicorn app.main:app --host 0.0.0.0 --port 8001` so the container
+can reach it. Compose defaults to `http://host.docker.internal:8001`.
+When running TripLedger directly on the host, start its API on port 8080.
+It defaults to `http://127.0.0.1:8001` for the agent. Override either default
 with `POLICY_AGENT_URL` when needed.
 
 In the Policy Assistant, try “What is the hotel limit for an L3 employee in
