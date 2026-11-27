@@ -12,7 +12,7 @@ from .receipts import read_receipt
 from .policy import policy_for, refresh, receipt_file, receipt_requests, evaluate, snapshot
 
 app = FastAPI(title="TripLedger API", version="1.3.0")
-app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173").split(","), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads")); UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 @app.on_event("startup")
